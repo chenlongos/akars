@@ -128,17 +128,14 @@ impl Motor {
         let raw = pwm as u16;
         let payload = [motor_id, (raw >> 8) as u8, raw as u8];
         self.send_frame(CMD_SET_SPEED, &payload);
-        let _ = self.recv_frame(Duration::from_millis(500));
     }
 
     fn cmd_stop(&mut self, motor_id: u8) {
         self.send_frame(CMD_STOP, &[motor_id]);
-        let _ = self.recv_frame(Duration::from_millis(500));
     }
 
     fn cmd_brake(&mut self, motor_id: u8) {
         self.send_frame(CMD_BRAKE, &[motor_id]);
-        let _ = self.recv_frame(Duration::from_millis(500));
     }
 
     fn send_frame(&mut self, cmd: u8, payload: &[u8]) {

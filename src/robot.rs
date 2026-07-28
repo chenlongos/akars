@@ -3,7 +3,7 @@ use crate::camera::UsbCamera;
 use crate::detector::Detection;
 use crate::image_bridge;
 use crate::motor::Motor;
-use crate::tpu::{InferTiming, InferenceConfig, YoloModel};
+use crate::tpu::{InferTiming, InferenceConfig, ModelInputFormat, YoloModel};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -129,16 +129,15 @@ pub fn run_tennis_hunter(
     let mut frame_count = 0u64;
     let mut frame_idx = 0u64;
     let (model_w, model_h) = model.input_dimensions();
-    let rgb_len = (model_w as usize)
-        .checked_mul(model_h as usize)
-        .and_then(|pixels| pixels.checked_mul(3))
-        .unwrap_or(0);
-    if rgb_len == 0 {
+    let input_format = model.input_format();
+    let input_len = input_format.buffer_len(model_w, model_h).unwrap_or(0);
+    if input_len == 0 {
         eprintln!("[camera] invalid model input size: {}x{}", model_w, model_h);
         motor.standby();
         return;
     }
-    let mut rgb_planar = vec![0u8; rgb_len];
+    eprintln!("[tpu] model input format: {input_format:?}");
+    let mut input_buffer = vec![0u8; input_len];
 
     arm.grab_pos();
 
@@ -163,9 +162,24 @@ pub fn run_tennis_hunter(
         let capture_us = capture_start.elapsed().as_micros() as i64;
 
         let preprocess_start = Instant::now();
-        if let Err(err) =
-            image_bridge::yuv422p_to_rgb_planar(&frame.pixels, &mut rgb_planar, model_w, model_h)
-        {
+        let preprocess_result = match input_format {
+            ModelInputFormat::RgbPlanar => image_bridge::yuv422p_to_rgb_planar(
+                &frame.pixels,
+                &mut input_buffer,
+                model_w,
+                model_h,
+            ),
+            ModelInputFormat::Yuv420Planar => {
+                image_bridge::yuv422p_to_yuv420p(&frame.pixels, &mut input_buffer, model_w, model_h)
+            }
+            ModelInputFormat::YuvNv12 => {
+                image_bridge::yuv422p_to_nv12(&frame.pixels, &mut input_buffer, model_w, model_h)
+            }
+            ModelInputFormat::YuvNv21 => {
+                image_bridge::yuv422p_to_nv21(&frame.pixels, &mut input_buffer, model_w, model_h)
+            }
+        };
+        if let Err(err) = preprocess_result {
             eprintln!("[pre] YUV preprocess failed: {err}");
             continue;
         }
@@ -174,13 +188,25 @@ pub fn run_tennis_hunter(
         let image_w = frame.width as i32;
         let image_h = frame.height as i32;
         let mut timing = InferTiming::default();
-        let detections = match model.infer_rgb_planar_timed(
-            &rgb_planar,
-            image_w,
-            image_h,
-            config.inference,
-            Some(&mut timing),
-        ) {
+        let inference_result = match input_format {
+            ModelInputFormat::RgbPlanar => model.infer_rgb_planar_timed(
+                &input_buffer,
+                image_w,
+                image_h,
+                config.inference,
+                Some(&mut timing),
+            ),
+            ModelInputFormat::Yuv420Planar
+            | ModelInputFormat::YuvNv12
+            | ModelInputFormat::YuvNv21 => model.infer_yuv420_timed(
+                &input_buffer,
+                image_w,
+                image_h,
+                config.inference,
+                Some(&mut timing),
+            ),
+        };
+        let detections = match inference_result {
             Ok(detections) => detections,
             Err(err) => {
                 eprintln!("[detect] inference failed: {err}");

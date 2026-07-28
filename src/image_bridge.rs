@@ -177,6 +177,143 @@ pub fn yuv422p_to_rgb_planar(
     Ok(())
 }
 
+/// Convert a YUV422 planar (I422 / YU16) frame into YUV420 planar (I420): a
+/// full-size Y plane, followed by U and V planes subsampled 2x horizontally and
+/// 2x vertically. Width and height must both be even.
+pub fn yuv422p_to_yuv420p(
+    yuv422: &[u8],
+    dst: &mut [u8],
+    width: i32,
+    height: i32,
+) -> Result<(), ImageBridgeError> {
+    let (w, h) = valid_dimensions(width, height)?;
+    let w = w as usize;
+    let h = h as usize;
+    if (w & 1) != 0 || (h & 1) != 0 {
+        return Err(ImageBridgeError::InvalidInput(
+            "I420 conversion requires even image dimensions",
+        ));
+    }
+
+    let y_size = w * h;
+    let src_chroma_w = w / 2;
+    let src_chroma_size = src_chroma_w * h;
+    let dst_chroma_h = h / 2;
+    let dst_chroma_size = src_chroma_w * dst_chroma_h;
+    let dst_len = y_size + 2 * dst_chroma_size;
+
+    if yuv422.len() < y_size + 2 * src_chroma_size {
+        return Err(ImageBridgeError::InvalidInput(
+            "YUV input smaller than one I422 frame",
+        ));
+    }
+    if dst.len() < dst_len {
+        return Err(ImageBridgeError::InvalidInput(
+            "destination tensor buffer is too small",
+        ));
+    }
+
+    let (src_y, chroma) = yuv422.split_at(y_size);
+    let (src_u, src_v) = chroma.split_at(src_chroma_size);
+    let (dst_y, dst_chroma) = dst.split_at_mut(y_size);
+    let (dst_u, dst_v) = dst_chroma.split_at_mut(dst_chroma_size);
+
+    dst_y.copy_from_slice(src_y);
+    downsample_i422_chroma_to_i420(src_u, dst_u, src_chroma_w, h);
+    downsample_i422_chroma_to_i420(src_v, dst_v, src_chroma_w, h);
+    Ok(())
+}
+
+/// Convert I422 into NV12: full-size Y plane followed by interleaved U/V pairs
+/// at 2x2 chroma subsampling.
+pub fn yuv422p_to_nv12(
+    yuv422: &[u8],
+    dst: &mut [u8],
+    width: i32,
+    height: i32,
+) -> Result<(), ImageBridgeError> {
+    yuv422p_to_yuv420sp(yuv422, dst, width, height, false)
+}
+
+/// Convert I422 into NV21: full-size Y plane followed by interleaved V/U pairs
+/// at 2x2 chroma subsampling.
+pub fn yuv422p_to_nv21(
+    yuv422: &[u8],
+    dst: &mut [u8],
+    width: i32,
+    height: i32,
+) -> Result<(), ImageBridgeError> {
+    yuv422p_to_yuv420sp(yuv422, dst, width, height, true)
+}
+
+fn yuv422p_to_yuv420sp(
+    yuv422: &[u8],
+    dst: &mut [u8],
+    width: i32,
+    height: i32,
+    vu_order: bool,
+) -> Result<(), ImageBridgeError> {
+    let (w, h) = valid_dimensions(width, height)?;
+    let w = w as usize;
+    let h = h as usize;
+    if (w & 1) != 0 || (h & 1) != 0 {
+        return Err(ImageBridgeError::InvalidInput(
+            "YUV420 conversion requires even image dimensions",
+        ));
+    }
+
+    let y_size = w * h;
+    let chroma_w = w / 2;
+    let src_chroma_size = chroma_w * h;
+    let dst_len = y_size + y_size / 2;
+
+    if yuv422.len() < y_size + 2 * src_chroma_size {
+        return Err(ImageBridgeError::InvalidInput(
+            "YUV input smaller than one I422 frame",
+        ));
+    }
+    if dst.len() < dst_len {
+        return Err(ImageBridgeError::InvalidInput(
+            "destination tensor buffer is too small",
+        ));
+    }
+
+    let (src_y, chroma) = yuv422.split_at(y_size);
+    let (src_u, src_v) = chroma.split_at(src_chroma_size);
+    let (dst_y, dst_uv) = dst.split_at_mut(y_size);
+    dst_y.copy_from_slice(src_y);
+
+    for row_pair in 0..h / 2 {
+        let src_row0 = row_pair * 2 * chroma_w;
+        let src_row1 = src_row0 + chroma_w;
+        let dst_row = row_pair * w;
+        for col in 0..chroma_w {
+            let u = ((src_u[src_row0 + col] as u16 + src_u[src_row1 + col] as u16 + 1) / 2) as u8;
+            let v = ((src_v[src_row0 + col] as u16 + src_v[src_row1 + col] as u16 + 1) / 2) as u8;
+            let dst_idx = dst_row + col * 2;
+            if vu_order {
+                dst_uv[dst_idx] = v;
+                dst_uv[dst_idx + 1] = u;
+            } else {
+                dst_uv[dst_idx] = u;
+                dst_uv[dst_idx + 1] = v;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn downsample_i422_chroma_to_i420(src: &[u8], dst: &mut [u8], chroma_w: usize, h: usize) {
+    for row_pair in 0..h / 2 {
+        let row0 = row_pair * 2 * chroma_w;
+        let row1 = row0 + chroma_w;
+        let dst_row = row_pair * chroma_w;
+        for col in 0..chroma_w {
+            dst[dst_row + col] = ((src[row0 + col] as u16 + src[row1 + col] as u16 + 1) / 2) as u8;
+        }
+    }
+}
+
 fn yuv422p_to_rgb_planar_scalar(
     y_plane: &[u8],
     u_plane: &[u8],
@@ -683,7 +820,10 @@ const FONT_HEIGHT: i32 = 7;
 
 #[cfg(test)]
 mod tests {
-    use super::{draw_detection, pack_rgb_planar_copy, text_size, ImagePreprocessor};
+    use super::{
+        draw_detection, pack_rgb_planar_copy, text_size, yuv422p_to_nv12, yuv422p_to_nv21,
+        yuv422p_to_yuv420p, ImagePreprocessor,
+    };
     use crate::detector::{Box2d, Detection};
     use image::codecs::jpeg::JpegEncoder;
     use image::{ExtendedColorType, Rgb, RgbImage};
@@ -757,6 +897,29 @@ mod tests {
         assert_eq!(*image.get_pixel(6, 6), Rgb([0, 255, 0]));
         assert_eq!(*image.get_pixel(6, 0), Rgb([0, 255, 0]));
         assert!(text_size("0 0.90", 2).0 > 0);
+    }
+
+    #[test]
+    fn converts_i422_to_yuv420_layouts() {
+        let y = [1, 2, 3, 4, 5, 6, 7, 8];
+        let u = [10, 20, 30, 40];
+        let v = [50, 60, 70, 80];
+        let mut src = Vec::new();
+        src.extend_from_slice(&y);
+        src.extend_from_slice(&u);
+        src.extend_from_slice(&v);
+
+        let mut i420 = vec![0; 12];
+        yuv422p_to_yuv420p(&src, &mut i420, 4, 2).unwrap();
+        assert_eq!(&i420, &[1, 2, 3, 4, 5, 6, 7, 8, 20, 30, 60, 70]);
+
+        let mut nv12 = vec![0; 12];
+        yuv422p_to_nv12(&src, &mut nv12, 4, 2).unwrap();
+        assert_eq!(&nv12, &[1, 2, 3, 4, 5, 6, 7, 8, 20, 60, 30, 70]);
+
+        let mut nv21 = vec![0; 12];
+        yuv422p_to_nv21(&src, &mut nv21, 4, 2).unwrap();
+        assert_eq!(&nv21, &[1, 2, 3, 4, 5, 6, 7, 8, 60, 20, 70, 30]);
     }
 
     fn encode_test_jpeg(width: u32, height: u32, pixel: impl Fn(u32, u32) -> Rgb<u8>) -> Vec<u8> {

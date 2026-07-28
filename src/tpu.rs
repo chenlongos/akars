@@ -38,6 +38,34 @@ pub struct InferTiming {
 #[derive(Debug)]
 pub struct TpuError(String);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelInputFormat {
+    RgbPlanar,
+    Yuv420Planar,
+    YuvNv12,
+    YuvNv21,
+}
+
+impl ModelInputFormat {
+    pub fn buffer_len(self, width: i32, height: i32) -> Result<usize, TpuError> {
+        if width <= 0 || height <= 0 {
+            return Err(TpuError::new("input tensor dimensions must be positive"));
+        }
+        let pixels = (width as usize)
+            .checked_mul(height as usize)
+            .ok_or_else(|| TpuError::new("input tensor dimensions overflow"))?;
+        match self {
+            Self::RgbPlanar => pixels
+                .checked_mul(3)
+                .ok_or_else(|| TpuError::new("RGB input tensor dimensions overflow")),
+            Self::Yuv420Planar | Self::YuvNv12 | Self::YuvNv21 => pixels
+                .checked_mul(3)
+                .and_then(|value| value.checked_div(2))
+                .ok_or_else(|| TpuError::new("YUV420 input tensor dimensions overflow")),
+        }
+    }
+}
+
 impl TpuError {
     fn new(message: impl Into<String>) -> Self {
         Self(message.into())
@@ -54,7 +82,7 @@ impl Error for TpuError {}
 
 #[cfg(target_arch = "riscv64")]
 mod imp {
-    use super::{CameraFrame, Detection, InferTiming, InferenceConfig, TpuError};
+    use super::{CameraFrame, Detection, InferTiming, InferenceConfig, ModelInputFormat, TpuError};
     use crate::detector::{correct_yolo_boxes, nms, parse_yolov8_output};
     use crate::image_bridge;
     use std::ffi::{c_char, c_int, c_void, CString};
@@ -71,6 +99,10 @@ mod imp {
     const CVI_FMT_UINT8: i32 = 7;
     const CVI_RC_SUCCESS: i32 = 0;
     const CVI_DIM_MAX: usize = 6;
+    const CVI_NN_PIXEL_RGB_PLANAR: i32 = 2;
+    const CVI_NN_PIXEL_YUV_NV12: i32 = 11;
+    const CVI_NN_PIXEL_YUV_NV21: i32 = 12;
+    const CVI_NN_PIXEL_YUV_420_PLANAR: i32 = 13;
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug)]
@@ -137,6 +169,7 @@ mod imp {
         input: *mut CviTensor,
         input_h: i32,
         input_w: i32,
+        input_format: ModelInputFormat,
         output_shapes: Vec<CviShape>,
         preprocessor: image_bridge::ImagePreprocessor,
     }
@@ -188,6 +221,14 @@ mod imp {
             let input_shape = unsafe { CVI_NN_TensorShape(input) };
             let input_h = input_shape.dim[2];
             let input_w = input_shape.dim[3];
+            let input_tensor = unsafe { &*input };
+            let input_format = match input_tensor.pixel_format {
+                CVI_NN_PIXEL_YUV_420_PLANAR => ModelInputFormat::Yuv420Planar,
+                CVI_NN_PIXEL_YUV_NV12 => ModelInputFormat::YuvNv12,
+                CVI_NN_PIXEL_YUV_NV21 => ModelInputFormat::YuvNv21,
+                CVI_NN_PIXEL_RGB_PLANAR => ModelInputFormat::RgbPlanar,
+                _ => ModelInputFormat::RgbPlanar,
+            };
             let outputs_slice = unsafe { slice::from_raw_parts_mut(outputs, output_num as usize) };
             let output_shapes = outputs_slice
                 .iter_mut()
@@ -203,6 +244,7 @@ mod imp {
                 input,
                 input_h,
                 input_w,
+                input_format,
                 output_shapes,
                 preprocessor: image_bridge::ImagePreprocessor::new(),
             })
@@ -220,6 +262,10 @@ mod imp {
             (self.input_w, self.input_h)
         }
 
+        pub fn input_format(&self) -> ModelInputFormat {
+            self.input_format
+        }
+
         pub fn infer_timed(
             &mut self,
             frame: &CameraFrame,
@@ -233,13 +279,8 @@ mod imp {
             // this is a plain color convert into the RGB planar tensor: no JPEG
             // decode, no resize, no letterbox.
             let pre_start = Instant::now();
-            image_bridge::yuv422p_to_rgb_planar(
-                &frame.pixels,
-                input,
-                self.input_w,
-                self.input_h,
-            )
-            .map_err(|err| TpuError::new(format!("YUV preprocess failed: {err}")))?;
+            image_bridge::yuv422p_to_rgb_planar(&frame.pixels, input, self.input_w, self.input_h)
+                .map_err(|err| TpuError::new(format!("YUV preprocess failed: {err}")))?;
             let preprocess_us = pre_start.elapsed().as_micros() as i64;
 
             let (detections, forward_us, postprocess_us) =
@@ -289,15 +330,56 @@ mod imp {
             Ok(detections)
         }
 
+        pub fn infer_yuv420_timed(
+            &mut self,
+            yuv420: &[u8],
+            image_w: i32,
+            image_h: i32,
+            config: InferenceConfig,
+            mut timing: Option<&mut InferTiming>,
+        ) -> Result<Vec<Detection>, TpuError> {
+            if !matches!(
+                self.input_format,
+                ModelInputFormat::Yuv420Planar
+                    | ModelInputFormat::YuvNv12
+                    | ModelInputFormat::YuvNv21
+            ) {
+                return Err(TpuError::new("model input is not YUV420"));
+            }
+
+            let copy_start = Instant::now();
+            let (input_ptr, input_len) = self.input_buffer()?;
+            if yuv420.len() < input_len {
+                return Err(TpuError::new("YUV420 input buffer is too small"));
+            }
+            let input = unsafe { slice::from_raw_parts_mut(input_ptr, input_len) };
+            input.copy_from_slice(&yuv420[..input_len]);
+            let copy_us = copy_start.elapsed().as_micros() as i64;
+
+            let (detections, forward_us, postprocess_us) =
+                self.forward_and_detections(config, image_w, image_h)?;
+
+            if let Some(t) = timing.as_deref_mut() {
+                *t = InferTiming {
+                    decode_us: 0,
+                    resize_us: copy_us,
+                    preprocess_us: copy_us,
+                    forward_us,
+                    postprocess_us,
+                };
+            }
+            Ok(detections)
+        }
+
         /// Resolve the input tensor's backing buffer as a raw pointer and its
-        /// required RGB-planar length. Returned as a raw pointer (not a slice)
+        /// required input length. Returned as a raw pointer (not a slice)
         /// so callers can also borrow `self` afterwards.
         fn input_buffer(&self) -> Result<(*mut u8, usize), TpuError> {
             let input_ptr = unsafe { CVI_NN_TensorPtr(self.input) as *mut u8 };
             if input_ptr.is_null() {
                 return Err(TpuError::new("input tensor pointer is null"));
             }
-            let input_len = rgb_tensor_len(self.input_w, self.input_h)?;
+            let input_len = self.input_format.buffer_len(self.input_w, self.input_h)?;
             let input_tensor = unsafe { &*self.input };
             if input_tensor.mem_size < input_len {
                 return Err(TpuError::new(format!(
@@ -414,16 +496,6 @@ mod imp {
         }
     }
 
-    fn rgb_tensor_len(width: i32, height: i32) -> Result<usize, TpuError> {
-        if width <= 0 || height <= 0 {
-            return Err(TpuError::new("input tensor dimensions must be positive"));
-        }
-        (width as usize)
-            .checked_mul(height as usize)
-            .and_then(|pixels| pixels.checked_mul(3))
-            .ok_or_else(|| TpuError::new("input tensor dimensions overflow"))
-    }
-
     fn tensor_to_f32(
         tensor: &CviTensor,
         ptr: *mut c_void,
@@ -465,7 +537,7 @@ mod imp {
 
 #[cfg(not(target_arch = "riscv64"))]
 mod imp {
-    use super::{CameraFrame, Detection, InferTiming, InferenceConfig, TpuError};
+    use super::{CameraFrame, Detection, InferTiming, InferenceConfig, ModelInputFormat, TpuError};
     use std::path::Path;
 
     pub struct YoloModel;
@@ -491,6 +563,10 @@ mod imp {
             (0, 0)
         }
 
+        pub fn input_format(&self) -> ModelInputFormat {
+            ModelInputFormat::RgbPlanar
+        }
+
         pub fn infer_timed(
             &mut self,
             _frame: &CameraFrame,
@@ -505,6 +581,19 @@ mod imp {
         pub fn infer_rgb_planar_timed(
             &mut self,
             _rgb_planar: &[u8],
+            _image_w: i32,
+            _image_h: i32,
+            _config: InferenceConfig,
+            _timing: Option<&mut InferTiming>,
+        ) -> Result<Vec<Detection>, TpuError> {
+            Err(TpuError::new(
+                "akars was built without SG2002 TPU runtime support",
+            ))
+        }
+
+        pub fn infer_yuv420_timed(
+            &mut self,
+            _yuv420: &[u8],
             _image_w: i32,
             _image_h: i32,
             _config: InferenceConfig,

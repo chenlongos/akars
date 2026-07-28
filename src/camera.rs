@@ -108,7 +108,7 @@ impl UsbCamera {
         if ret < 0 {
             return Err(io::Error::last_os_error());
         }
- 
+
         // eprintln!("[camera] ioctl returned {ret} bytes");
         // The kernel may signal success with 0 or report the byte count; either
         // way we expect one full I420 frame in the buffer.
