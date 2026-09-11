@@ -230,10 +230,13 @@ impl Default for v4l2_streamparm {
 }
 
 // ─── Ioctl 封装 ──────────────────────────────────────────────────────────────
+//
+// 直接复用 linux.rs 中已经声明的 libc `ioctl`（varargs 版）。
+// 这样整个 crate 只保留一份 extern 声明，不会有 clashing_extern_declarations 警告。
 
 /// 执行 ioctl 系统调用，arg 是指向参数的裸指针。
 pub fn ioctl_ptr<T>(fd: i32, request: c_ulong, ptr: *mut T) -> io::Result<i32> {
-    let ret = unsafe { raw_ioctl(fd, request, ptr as *mut c_void) };
+    let ret = unsafe { crate::linux::ioctl(fd, request, ptr as *mut c_void) };
     if ret < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -241,9 +244,9 @@ pub fn ioctl_ptr<T>(fd: i32, request: c_ulong, ptr: *mut T) -> io::Result<i32> {
     }
 }
 
-/// ioctl 不带参数（实际传 0）。
+/// ioctl 不带参数（实际传 0/null）。
 pub fn ioctl_noarg(fd: i32, request: c_ulong) -> io::Result<i32> {
-    let ret = unsafe { raw_ioctl(fd, request, std::ptr::null_mut::<c_void>()) };
+    let ret = unsafe { crate::linux::ioctl(fd, request, std::ptr::null_mut::<c_void>()) };
     if ret < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -255,11 +258,6 @@ pub fn ioctl_noarg(fd: i32, request: c_ulong) -> io::Result<i32> {
 pub fn ioctl_u32_ptr(fd: i32, request: c_ulong, value: u32) -> io::Result<i32> {
     let val = value;
     ioctl_ptr(fd, request, &val as *const u32 as *mut u32)
-}
-
-unsafe extern "C" {
-    #[link_name = "ioctl"]
-    fn raw_ioctl(fd: c_int, request: c_ulong, arg: *mut c_void) -> c_int;
 }
 
 // ─── mmap 封装 ───────────────────────────────────────────────────────────────

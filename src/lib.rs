@@ -1,5 +1,6 @@
 pub mod arm;
 pub mod camera;
+pub mod config;
 pub mod detector;
 pub mod image_bridge;
 pub mod linux;

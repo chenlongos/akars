@@ -1,30 +1,61 @@
 use crate::serial::SerialPort;
+use serde::{Deserialize, Serialize};
 use std::io;
 use std::thread;
 use std::time::Duration;
 
-const ID2_ANGLE_OPEN: f32 = 140.0;
-const ID2_ANGLE_CLOSE: f32 = 90.0;
 const ANGLE_MAX: f32 = 270.0;
 const PULSE_MIN: i32 = 500;
 const PULSE_MAX: i32 = 2500;
 
-const SERVO0_READY: f32 = 180.0;
-const SERVO1_READY: f32 = 185.0;
-const SERVO0_GRAB: f32 = 245.0;
-const SERVO1_GRAB: f32 = 185.0;
-const SERVO0_LIFT: f32 = 180.0;
-const SERVO1_LIFT: f32 = 100.0;
+/// 单个双舵机位置（servo0 + servo1）。
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub struct ArmPosition {
+    pub servo0: f32,
+    pub servo1: f32,
+}
+
+/// 机械臂运动点位配置（从 arm.json 加载）。
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub struct ArmMotionConfig {
+    /// 抓取位置：机械臂伸向物体。
+    pub grab_position: ArmPosition,
+    /// 抬起位置：抓住物体后抬起。同时也作为「预备/回位」位置使用。
+    pub lift_position: ArmPosition,
+    /// 夹爪打开角度（servo2）。
+    pub gripper_open: f32,
+    /// 夹爪关闭角度（servo2）。
+    pub gripper_close: f32,
+}
+
+impl Default for ArmMotionConfig {
+    fn default() -> Self {
+        Self {
+            grab_position: ArmPosition {
+                servo0: 245.0,
+                servo1: 185.0,
+            },
+            lift_position: ArmPosition {
+                servo0: 180.0,
+                servo1: 100.0,
+            },
+            gripper_open: 140.0,
+            gripper_close: 90.0,
+        }
+    }
+}
 
 pub struct Arm {
     port: SerialPort,
+    motion: ArmMotionConfig,
 }
 
 impl Arm {
-    pub fn open(device: &str, baudrate: i32) -> io::Result<Self> {
+    pub fn open(device: &str, baudrate: i32, motion: ArmMotionConfig) -> io::Result<Self> {
         crate::pinmux::configure_for_device(device);
         Ok(Self {
             port: SerialPort::open(device, baudrate, false)?,
+            motion,
         })
     }
 
@@ -42,40 +73,54 @@ impl Arm {
         self.send_command(&format!("#{servo_id:03}PULR"));
     }
 
+    pub fn motion_config(&self) -> &ArmMotionConfig {
+        &self.motion
+    }
+
+    pub fn set_motion_config(&mut self, motion: ArmMotionConfig) {
+        self.motion = motion;
+    }
+
+    /// 完整抓取动作：伸臂 → 夹取 → 抬起。
     pub fn grab(&mut self) {
-        self.set_angle(0, SERVO0_GRAB, 1000);
-        self.set_angle(1, SERVO1_GRAB, 1000);
-        self.set_angle(2, ID2_ANGLE_OPEN, 1000);
+        let m = self.motion;
+        self.set_angle(0, m.grab_position.servo0, 1000);
+        self.set_angle(1, m.grab_position.servo1, 1000);
+        self.set_angle(2, m.gripper_open, 1000);
         sleep_ms(1500);
 
-        self.set_angle(2, ID2_ANGLE_CLOSE, 1000);
+        self.set_angle(2, m.gripper_close, 1000);
         sleep_ms(1000);
 
-        self.set_angle(0, SERVO0_LIFT, 1000);
-        self.set_angle(1, SERVO1_LIFT, 1000);
+        self.set_angle(0, m.lift_position.servo0, 1000);
+        self.set_angle(1, m.lift_position.servo1, 1000);
         sleep_ms(1200);
     }
 
+    /// 回到预备/回位位置（用 lift_position 作为 ready）。
     pub fn release_pos(&mut self) {
-        self.set_angle(0, SERVO0_READY, 1000);
-        self.set_angle(1, SERVO1_READY, 1000);
-        self.set_angle(2, ID2_ANGLE_OPEN, 1000);
+        let m = self.motion;
+        self.set_angle(0, m.lift_position.servo0, 1000);
+        self.set_angle(1, m.lift_position.servo1, 1000);
+        self.set_angle(2, m.gripper_open, 1000);
     }
 
+    /// 只张开夹爪，不移动主体。
     pub fn release(&mut self) {
-        self.set_angle(2, ID2_ANGLE_OPEN, 1000);
+        self.set_angle(2, self.motion.gripper_open, 1000);
     }
 
+    /// 回到预备/回位位置（同 release_pos）。
     pub fn grab_pos(&mut self) {
-        self.set_angle(0, SERVO0_READY, 1000);
-        self.set_angle(1, SERVO1_READY, 1000);
-        self.set_angle(2, ID2_ANGLE_OPEN, 1000);
+        self.release_pos();
     }
 
+    /// 展示/举起：抬臂 + 夹取姿态。
     pub fn show(&mut self) {
-        self.set_angle(0, SERVO0_LIFT, 1000);
-        self.set_angle(1, SERVO1_LIFT, 1000);
-        self.set_angle(2, ID2_ANGLE_CLOSE, 1000);
+        let m = self.motion;
+        self.set_angle(0, m.lift_position.servo0, 1000);
+        self.set_angle(1, m.lift_position.servo1, 1000);
+        self.set_angle(2, m.gripper_close, 1000);
     }
 
     fn send_command(&mut self, command: &str) {

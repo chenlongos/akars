@@ -54,7 +54,7 @@ pub struct UsbCamera {
 }
 
 impl UsbCamera {
-    pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+    pub fn open<P: AsRef<Path>>(path: P, mut width: u32, mut height: u32) -> io::Result<Self> {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -89,15 +89,15 @@ impl UsbCamera {
 
         // ── 2. 协商格式（YUYV 优先, MJPEG 回退） ────────────────────────
         // YUYV→RGB 是纯 CPU 计算（比 MJPEG 解码快得多），先试 YUYV。
-        let mut width = 640u32;
-        let mut height = 480u32;
+        let requested_w = width;
+        let requested_h = height;
         let mut pixelformat = v4l2::V4L2_PIX_FMT_YUYV;
 
-        let mut fmt_set = try_set_format(fd, pixelformat, width, height)?;
+        let mut fmt_set = try_set_format(fd, pixelformat, requested_w, requested_h)?;
         if fmt_set.pixelformat != pixelformat {
             eprintln!("[camera] YUYV not supported, trying MJPEG");
             pixelformat = v4l2::V4L2_PIX_FMT_MJPEG;
-            fmt_set = try_set_format(fd, pixelformat, width, height)?;
+            fmt_set = try_set_format(fd, pixelformat, requested_w, requested_h)?;
         }
         width = fmt_set.width;
         height = fmt_set.height;

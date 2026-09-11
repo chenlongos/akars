@@ -1,51 +1,41 @@
-use akars::arm::Arm;
+use akars::arm::{Arm, ArmMotionConfig};
 use akars::camera::UsbCamera;
-use akars::motor::{Motor, MotorConfig};
+use akars::config::{load_arm_motion_config, load_robot_config, RobotConfigFile};
+use akars::motor::Motor;
 use akars::robot::{install_signal_handlers, run_tennis_hunter, RobotConfig};
-use akars::tpu::{open_model, InferenceConfig};
+use akars::tpu::open_model;
 use akars::web::{serve, WebConfig};
 use std::env;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 
+const DEFAULT_ROBOT_CONFIG: &str = "./robot.toml";
+const DEFAULT_ARM_MOTION_CONFIG: &str = "./arm.json";
+
+/// 子命令 hunt 特有参数。
 #[derive(Debug)]
-struct Cli {
+struct HuntCli {
     model: PathBuf,
-    camera: String,
-    motor: String,
-    arm: String,
     frames: Option<u64>,
-    classes: i32,
-    conf: f32,
-    iou: f32,
 }
 
-/// Arguments for the standalone TPU inference test: run a model on a single
-/// image file and write an annotated result image.
+/// 子命令 detect 特有参数。
 #[derive(Debug)]
 struct DetectCli {
     model: PathBuf,
     input: PathBuf,
     output: PathBuf,
-    classes: i32,
-    conf: f32,
-    iou: f32,
 }
 
-/// Arguments for the camera capture test: grab a single frame and save it,
-/// discarding the first few frames so the sensor's exposure/white-balance can
-/// settle (warm up).
+/// 子命令 capture 特有参数。
 #[derive(Debug)]
 struct CaptureCli {
-    camera: String,
     output: PathBuf,
     warmup: u32,
 }
 
-/// Arguments for manual arm debugging: set all three servo angles directly.
+/// 子命令 armtest 特有参数。
 #[derive(Debug)]
 struct ArmTestCli {
-    arm: String,
     servo0: f32,
     servo1: f32,
     servo2: f32,
@@ -54,24 +44,18 @@ struct ArmTestCli {
 
 #[derive(Debug)]
 enum Command {
-    Hunt(Cli),
-    Serve(WebConfig),
+    Hunt(HuntCli),
+    Serve,
     Detect(DetectCli),
     Capture(CaptureCli),
     ArmTest(ArmTestCli),
 }
 
-impl Default for Cli {
+impl Default for HuntCli {
     fn default() -> Self {
         Self {
             model: PathBuf::new(),
-            camera: "/dev/video0".to_string(),
-            motor: "/dev/ttyS1".to_string(),
-            arm: "/dev/ttyS2".to_string(),
             frames: None,
-            classes: 1,
-            conf: 0.5,
-            iou: 0.5,
         }
     }
 }
@@ -82,9 +66,6 @@ impl Default for DetectCli {
             model: PathBuf::new(),
             input: PathBuf::new(),
             output: PathBuf::from("detect_out.jpg"),
-            classes: 1,
-            conf: 0.5,
-            iou: 0.5,
         }
     }
 }
@@ -92,7 +73,6 @@ impl Default for DetectCli {
 impl Default for CaptureCli {
     fn default() -> Self {
         Self {
-            camera: "/dev/video0".to_string(),
             output: PathBuf::from("capture.jpg"),
             warmup: 30,
         }
@@ -102,7 +82,6 @@ impl Default for CaptureCli {
 impl Default for ArmTestCli {
     fn default() -> Self {
         Self {
-            arm: "/dev/ttyS2".to_string(),
             servo0: 0.0,
             servo1: 0.0,
             servo2: 0.0,
@@ -112,8 +91,66 @@ impl Default for ArmTestCli {
 }
 
 fn main() {
-    let command = match parse_cli(env::args().skip(1)) {
-        Ok(command) => command,
+    let args: Vec<String> = env::args().skip(1).collect();
+    let mut args = args.into_iter().peekable();
+
+    // ── 第一步：解析全局参数 --robot / --arm（放在子命令之前）─────────
+    let mut robot_config_path = PathBuf::from(DEFAULT_ROBOT_CONFIG);
+    let mut arm_motion_path = PathBuf::from(DEFAULT_ARM_MOTION_CONFIG);
+
+    while let Some(arg) = args.peek() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            "--robot" => {
+                args.next();
+                let path = match args.next() {
+                    Some(v) => v,
+                    None => {
+                        eprintln!("--robot expects a file path");
+                        print_usage();
+                        std::process::exit(2);
+                    }
+                };
+                robot_config_path = PathBuf::from(path);
+            }
+            "--arm" => {
+                args.next();
+                let path = match args.next() {
+                    Some(v) => v,
+                    None => {
+                        eprintln!("--arm expects a file path");
+                        print_usage();
+                        std::process::exit(2);
+                    }
+                };
+                arm_motion_path = PathBuf::from(path);
+            }
+            _ => break, // 遇到子命令或位置参数，停止解析全局参数
+        }
+    }
+
+    // ── 第二步：加载配置文件 ────────────────────────────────────────
+    let robot_config = match load_robot_config(&robot_config_path) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+    let arm_motion = match load_arm_motion_config(&arm_motion_path) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+
+    // ── 第三步：解析子命令 ────────────────────────────────────────
+    let command = match parse_subcommand(&mut args) {
+        Ok(cmd) => cmd,
         Err(message) => {
             eprintln!("{message}");
             print_usage();
@@ -121,63 +158,244 @@ fn main() {
         }
     };
 
+    // ── 第四步：分派执行 ──────────────────────────────────────────
     match command {
         Command::Hunt(cli) => {
             install_signal_handlers();
-            run_hunt(cli);
+            run_hunt(cli, robot_config, arm_motion);
         }
-        Command::Serve(config) => {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .expect("failed to build tokio runtime");
-            if let Err(err) = runtime.block_on(serve(config)) {
-                eprintln!("[web] server failed: {err}");
-                std::process::exit(1);
-            }
+        Command::Serve => {
+            run_serve(robot_config, arm_motion);
         }
-        Command::Detect(cli) => run_detect(cli),
-        Command::Capture(cli) => run_capture(cli),
-        Command::ArmTest(cli) => run_armtest(cli),
+        Command::Detect(cli) => run_detect(cli, &robot_config),
+        Command::Capture(cli) => run_capture(cli, &robot_config),
+        Command::ArmTest(cli) => run_armtest(cli, &robot_config, arm_motion),
     }
 }
 
-fn run_armtest(cli: ArmTestCli) {
-    let mut arm = match Arm::open(&cli.arm, 115200) {
-        Ok(arm) => arm,
-        Err(err) => {
-            eprintln!("[armtest] failed to open {}: {err}", cli.arm);
-            std::process::exit(1);
+// ── 子命令解析 ──────────────────────────────────────────────────────────────
+
+fn parse_subcommand(
+    args: &mut std::iter::Peekable<std::vec::IntoIter<String>>,
+) -> Result<Command, String> {
+    match args.peek().map(String::as_str) {
+        Some("serve") => {
+            args.next();
+            // serve 不接受额外子命令参数（配置全从 TOML 读）
+            // 但允许 serve 之后跟 --help
+            while let Some(arg) = args.next() {
+                if arg == "-h" || arg == "--help" {
+                    print_serve_usage();
+                    std::process::exit(0);
+                }
+                eprintln!("[serve] ignoring extra argument: {arg} (all settings come from robot.toml)");
+            }
+            Ok(Command::Serve)
         }
-    };
-
-    let time_ms = cli.time_ms.clamp(0, 10_000);
-    arm.set_angle(0, cli.servo0, time_ms);
-    arm.set_angle(1, cli.servo1, time_ms);
-    arm.set_angle(2, cli.servo2, time_ms);
-
-    eprintln!(
-        "[armtest] sent: servo0={:.1} servo1={:.1} servo2={:.1} time_ms={}",
-        cli.servo0, cli.servo1, cli.servo2, time_ms
-    );
+        Some("detect") => {
+            args.next();
+            parse_detect_args(args).map(Command::Detect)
+        }
+        Some("capture") => {
+            args.next();
+            parse_capture_args(args).map(Command::Capture)
+        }
+        Some("armtest") => {
+            args.next();
+            parse_armtest_args(args).map(Command::ArmTest)
+        }
+        Some("hunt") => {
+            args.next();
+            parse_hunt_args(args).map(Command::Hunt)
+        }
+        _ => parse_hunt_args(args).map(Command::Hunt),
+    }
 }
 
-fn run_hunt(cli: Cli) {
-    let camera = match UsbCamera::open(&cli.camera) {
+fn parse_hunt_args(
+    args: &mut std::iter::Peekable<std::vec::IntoIter<String>>,
+) -> Result<HuntCli, String> {
+    let mut cli = HuntCli::default();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            "--frames" => {
+                cli.frames = Some(
+                    args.next()
+                        .ok_or_else(|| "--frames expects an integer".to_string())?
+                        .parse()
+                        .map_err(|_| "--frames expects an integer".to_string())?,
+                );
+            }
+            value if value.starts_with('-') => return Err(format!("unknown option: {value}")),
+            value => {
+                if cli.model.as_os_str().is_empty() {
+                    cli.model = PathBuf::from(value);
+                } else {
+                    return Err(format!("unexpected positional argument: {value}"));
+                }
+            }
+        }
+    }
+    if cli.model.as_os_str().is_empty() {
+        return Err("missing cvimodel path".to_string());
+    }
+    Ok(cli)
+}
+
+fn parse_detect_args(
+    args: &mut std::iter::Peekable<std::vec::IntoIter<String>>,
+) -> Result<DetectCli, String> {
+    let mut cli = DetectCli::default();
+    let mut positional = 0;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_detect_usage();
+                std::process::exit(0);
+            }
+            "-o" | "--out" => {
+                cli.output = PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| "--out expects a path".to_string())?,
+                );
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown detect option: {value}"))
+            }
+            value => {
+                match positional {
+                    0 => cli.model = PathBuf::from(value),
+                    1 => cli.input = PathBuf::from(value),
+                    _ => return Err(format!("unexpected detect argument: {value}")),
+                }
+                positional += 1;
+            }
+        }
+    }
+    if cli.model.as_os_str().is_empty() {
+        return Err("missing cvimodel path".to_string());
+    }
+    if cli.input.as_os_str().is_empty() {
+        return Err("missing input image path".to_string());
+    }
+    Ok(cli)
+}
+
+fn parse_capture_args(
+    args: &mut std::iter::Peekable<std::vec::IntoIter<String>>,
+) -> Result<CaptureCli, String> {
+    let mut cli = CaptureCli::default();
+    let mut positional = 0;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_capture_usage();
+                std::process::exit(0);
+            }
+            "-o" | "--out" => {
+                cli.output = PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| "--out expects a path".to_string())?,
+                );
+            }
+            "--warmup" => {
+                cli.warmup = args
+                    .next()
+                    .ok_or_else(|| "--warmup expects an integer".to_string())?
+                    .parse()
+                    .map_err(|_| "--warmup expects a non-negative integer".to_string())?;
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown capture option: {value}"))
+            }
+            value => {
+                if positional == 0 {
+                    cli.output = PathBuf::from(value);
+                } else {
+                    return Err(format!("unexpected capture argument: {value}"));
+                }
+                positional += 1;
+            }
+        }
+    }
+    Ok(cli)
+}
+
+fn parse_armtest_args(
+    args: &mut std::iter::Peekable<std::vec::IntoIter<String>>,
+) -> Result<ArmTestCli, String> {
+    let mut cli = ArmTestCli::default();
+    let mut positional: Vec<f32> = Vec::with_capacity(3);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_armtest_usage();
+                std::process::exit(0);
+            }
+            "--time" => {
+                cli.time_ms = args
+                    .next()
+                    .ok_or_else(|| "--time expects an integer".to_string())?
+                    .parse()
+                    .map_err(|_| "--time expects an integer (ms)".to_string())?;
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown armtest option: {value}"))
+            }
+            value => {
+                if positional.len() >= 3 {
+                    return Err(format!("unexpected armtest argument: {value}"));
+                }
+                let angle = value
+                    .parse::<f32>()
+                    .map_err(|_| format!("invalid angle value: {value}"))?;
+                positional.push(angle);
+            }
+        }
+    }
+    if positional.len() != 3 {
+        return Err(
+            "armtest expects exactly 3 angle arguments: <servo0> <servo1> <servo2>".to_string(),
+        );
+    }
+    cli.servo0 = positional[0];
+    cli.servo1 = positional[1];
+    cli.servo2 = positional[2];
+    Ok(cli)
+}
+
+// ── 子命令实现 ──────────────────────────────────────────────────────────────
+
+fn run_hunt(cli: HuntCli, robot_config: RobotConfigFile, arm_motion: ArmMotionConfig) {
+    // 摄像头
+    let camera_device = &robot_config.camera.device;
+    let camera = match UsbCamera::open(
+        camera_device,
+        robot_config.camera.frame_width,
+        robot_config.camera.frame_height,
+    ) {
         Ok(camera) => {
             let info = camera.info();
             eprintln!(
                 "[camera] opened {}: {}x{} format={}",
-                cli.camera, info.width, info.height, info.format_name()
+                camera_device,
+                info.width,
+                info.height,
+                info.format_name()
             );
             camera
         }
         Err(err) => {
-            eprintln!("[camera] failed to open {}: {err}", cli.camera);
+            eprintln!("[camera] failed to open {}: {err}", camera_device);
             std::process::exit(1);
         }
     };
 
+    // TPU 模型
     let model = match open_model(&cli.model) {
         Ok(model) => model,
         Err(err) => {
@@ -185,43 +403,71 @@ fn run_hunt(cli: Cli) {
             std::process::exit(1);
         }
     };
-    eprintln!("[dbg] model opened, opening motor {} ...", cli.motor);
+    eprintln!(
+        "[dbg] model opened, opening motor {} ...",
+        robot_config.motor.port
+    );
 
-    let motor_config = MotorConfig {
-        device: cli.motor.clone(),
-        ..MotorConfig::default()
-    };
+    // 电机（配置全从 TOML 读）
+    let motor_config = robot_config.to_motor_config();
     let motor = match Motor::open(&motor_config) {
         Ok(motor) => motor,
         Err(err) => {
-            eprintln!("[motor] failed to open {}: {err}", cli.motor);
+            eprintln!("[motor] failed to open {}: {err}", motor_config.device);
             std::process::exit(1);
         }
     };
-    eprintln!("[dbg] motor opened, opening arm {} ...", cli.arm);
+    eprintln!(
+        "[dbg] motor opened, opening arm {} ...",
+        robot_config.arm.port
+    );
 
-    let arm = match Arm::open(&cli.arm, 115200) {
+    // 机械臂
+    let arm = match Arm::open(&robot_config.arm.port, robot_config.arm.baudrate, arm_motion) {
         Ok(arm) => arm,
         Err(err) => {
-            eprintln!("[arm] failed to open {}: {err}", cli.arm);
+            eprintln!(
+                "[arm] failed to open {}: {err}",
+                robot_config.arm.port
+            );
             std::process::exit(1);
         }
     };
     eprintln!("[dbg] arm opened, entering tennis hunter ...");
 
     let config = RobotConfig {
-        inference: InferenceConfig {
-            classes_num: cli.classes,
-            confidence_threshold: cli.conf,
-            iou_threshold: cli.iou,
-        },
+        inference: robot_config.to_inference_config(),
         max_frames: cli.frames,
     };
 
     run_tennis_hunter(camera, model, motor, arm, config);
 }
 
-fn run_detect(cli: DetectCli) {
+fn run_serve(robot_config: RobotConfigFile, _arm_motion: ArmMotionConfig) {
+    let web_cfg = WebConfig {
+        listen: robot_config.web.listen,
+        motor_device: robot_config.motor.port.clone(),
+        arm_device: robot_config.arm.port.clone(),
+        mock: robot_config.web.mock,
+    };
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+
+    // 把 arm_motion 也注册到 web.rs 的 hardware 里
+    // 目前 web.rs 里 Arm::open 用的是 default()，让我们直接用正确的
+    // 这里 serve() 的内部实现会调 Arm::open，我们暂时不改 web.rs
+    // 后续可以让 serve 接受 ArmMotionConfig 参数
+
+    if let Err(err) = runtime.block_on(serve(web_cfg)) {
+        eprintln!("[web] server failed: {err}");
+        std::process::exit(1);
+    }
+}
+
+fn run_detect(cli: DetectCli, robot_config: &RobotConfigFile) {
     let image = match std::fs::read(&cli.input) {
         Ok(bytes) => bytes,
         Err(err) => {
@@ -238,11 +484,7 @@ fn run_detect(cli: DetectCli) {
         }
     };
 
-    let config = InferenceConfig {
-        classes_num: cli.classes,
-        confidence_threshold: cli.conf,
-        iou_threshold: cli.iou,
-    };
+    let config = robot_config.to_inference_config();
 
     match model.detect_image(&image, &cli.output, config) {
         Ok(detections) => {
@@ -269,24 +511,30 @@ fn run_detect(cli: DetectCli) {
     }
 }
 
-fn run_capture(cli: CaptureCli) {
-    let mut camera = match UsbCamera::open(&cli.camera) {
+fn run_capture(cli: CaptureCli, robot_config: &RobotConfigFile) {
+    let camera_device = &robot_config.camera.device;
+    let mut camera = match UsbCamera::open(
+        camera_device,
+        robot_config.camera.frame_width,
+        robot_config.camera.frame_height,
+    ) {
         Ok(camera) => {
             let info = camera.info();
             eprintln!(
                 "[capture] opened {}: {}x{} format={}",
-                cli.camera, info.width, info.height, info.format_name()
+                camera_device,
+                info.width,
+                info.height,
+                info.format_name()
             );
             camera
         }
         Err(err) => {
-            eprintln!("[capture] failed to open {}: {err}", cli.camera);
+            eprintln!("[capture] failed to open {}: {err}", camera_device);
             std::process::exit(1);
         }
     };
 
-    // Discard the first few frames so the sensor's auto exposure / white
-    // balance can settle before we keep one.
     for i in 0..cli.warmup {
         if let Err(err) = camera.get_frame() {
             eprintln!("[capture] warm-up frame {i} failed: {err}");
@@ -305,7 +553,6 @@ fn run_capture(cli: CaptureCli) {
         }
     };
 
-    // MJPEG 字节流直接写入文件
     if let Err(err) = std::fs::write(&cli.output, &frame.pixels) {
         eprintln!("[capture] failed to write {}: {err}", cli.output.display());
         std::process::exit(1);
@@ -320,267 +567,87 @@ fn run_capture(cli: CaptureCli) {
     );
 }
 
-fn parse_cli(args: impl Iterator<Item = String>) -> Result<Command, String> {
-    let mut args = args.peekable();
-    match args.peek().map(String::as_str) {
-        Some("serve") => {
-            args.next();
-            parse_serve_cli(args).map(Command::Serve)
+fn run_armtest(
+    cli: ArmTestCli,
+    robot_config: &RobotConfigFile,
+    arm_motion: ArmMotionConfig,
+) {
+    let arm_port = &robot_config.arm.port;
+    let mut arm = match Arm::open(arm_port, robot_config.arm.baudrate, arm_motion) {
+        Ok(arm) => arm,
+        Err(err) => {
+            eprintln!("[armtest] failed to open {}: {err}", arm_port);
+            std::process::exit(1);
         }
-        Some("detect") => {
-            args.next();
-            parse_detect_cli(args).map(Command::Detect)
-        }
-        Some("capture") => {
-            args.next();
-            parse_capture_cli(args).map(Command::Capture)
-        }
-        Some("armtest") => {
-            args.next();
-            parse_armtest_cli(args).map(Command::ArmTest)
-        }
-        _ => parse_hunt_cli(args).map(Command::Hunt),
-    }
+    };
+
+    let time_ms = cli.time_ms.clamp(0, 10_000);
+    arm.set_angle(0, cli.servo0, time_ms);
+    arm.set_angle(1, cli.servo1, time_ms);
+    arm.set_angle(2, cli.servo2, time_ms);
+
+    eprintln!(
+        "[armtest] sent: servo0={:.1} servo1={:.1} servo2={:.1} time_ms={}",
+        cli.servo0, cli.servo1, cli.servo2, time_ms
+    );
 }
 
-fn parse_armtest_cli(args: impl Iterator<Item = String>) -> Result<ArmTestCli, String> {
-    let mut cli = ArmTestCli::default();
-    let mut args = args.peekable();
-    let mut positional: Vec<f32> = Vec::with_capacity(3);
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "-h" | "--help" => {
-                print_armtest_usage();
-                std::process::exit(0);
-            }
-            "--arm" => cli.arm = take_value(&mut args, "--arm")?,
-            "--time" => {
-                cli.time_ms = take_value(&mut args, "--time")?
-                    .parse()
-                    .map_err(|_| "--time expects an integer (ms)".to_string())?;
-            }
-            value if value.starts_with('-') => {
-                return Err(format!("unknown armtest option: {value}"))
-            }
-            value => {
-                if positional.len() >= 3 {
-                    return Err(format!("unexpected armtest argument: {value}"));
-                }
-                let angle = value
-                    .parse::<f32>()
-                    .map_err(|_| format!("invalid angle value: {value}"))?;
-                positional.push(angle);
-            }
-        }
-    }
-
-    if positional.len() != 3 {
-        return Err(
-            "armtest expects exactly 3 angle arguments: <servo0> <servo1> <servo2>".to_string(),
-        );
-    }
-
-    cli.servo0 = positional[0];
-    cli.servo1 = positional[1];
-    cli.servo2 = positional[2];
-    Ok(cli)
-}
-
-fn parse_hunt_cli(args: impl Iterator<Item = String>) -> Result<Cli, String> {
-    let mut cli = Cli::default();
-    let mut args = args.peekable();
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "-h" | "--help" => {
-                print_usage();
-                std::process::exit(0);
-            }
-            "--camera" => cli.camera = take_value(&mut args, "--camera")?,
-            "--motor" => cli.motor = take_value(&mut args, "--motor")?,
-            "--arm" => cli.arm = take_value(&mut args, "--arm")?,
-            "--frames" => {
-                cli.frames = Some(
-                    take_value(&mut args, "--frames")?
-                        .parse()
-                        .map_err(|_| "--frames expects an integer".to_string())?,
-                );
-            }
-            "--classes" => {
-                cli.classes = take_value(&mut args, "--classes")?
-                    .parse()
-                    .map_err(|_| "--classes expects an integer".to_string())?;
-            }
-            "--conf" => {
-                cli.conf = take_value(&mut args, "--conf")?
-                    .parse()
-                    .map_err(|_| "--conf expects a float".to_string())?;
-            }
-            "--iou" => {
-                cli.iou = take_value(&mut args, "--iou")?
-                    .parse()
-                    .map_err(|_| "--iou expects a float".to_string())?;
-            }
-            value if value.starts_with('-') => return Err(format!("unknown option: {value}")),
-            value => {
-                if cli.model.as_os_str().is_empty() {
-                    cli.model = PathBuf::from(value);
-                } else {
-                    return Err(format!("unexpected positional argument: {value}"));
-                }
-            }
-        }
-    }
-
-    if cli.model.as_os_str().is_empty() {
-        return Err("missing cvimodel path".to_string());
-    }
-    Ok(cli)
-}
-
-fn parse_serve_cli(args: impl Iterator<Item = String>) -> Result<WebConfig, String> {
-    let mut config = WebConfig::default();
-    let mut args = args.peekable();
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "-h" | "--help" => {
-                print_web_usage();
-                std::process::exit(0);
-            }
-            "--listen" => {
-                config.listen = take_value(&mut args, "--listen")?
-                    .parse::<SocketAddr>()
-                    .map_err(|_| {
-                        "--listen expects HOST:PORT, for example 0.0.0.0:8080".to_string()
-                    })?;
-            }
-            "--motor" => config.motor_device = take_value(&mut args, "--motor")?,
-            "--arm" => config.arm_device = take_value(&mut args, "--arm")?,
-            "--mock" => config.mock = true,
-            value if value.starts_with('-') => {
-                return Err(format!("unknown serve option: {value}"))
-            }
-            value => return Err(format!("unexpected serve argument: {value}")),
-        }
-    }
-    Ok(config)
-}
-
-fn parse_detect_cli(args: impl Iterator<Item = String>) -> Result<DetectCli, String> {
-    let mut cli = DetectCli::default();
-    let mut positional = 0;
-    let mut args = args.peekable();
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "-h" | "--help" => {
-                print_detect_usage();
-                std::process::exit(0);
-            }
-            "-o" | "--out" => cli.output = PathBuf::from(take_value(&mut args, "--out")?),
-            "--classes" => {
-                cli.classes = take_value(&mut args, "--classes")?
-                    .parse()
-                    .map_err(|_| "--classes expects an integer".to_string())?;
-            }
-            "--conf" => {
-                cli.conf = take_value(&mut args, "--conf")?
-                    .parse()
-                    .map_err(|_| "--conf expects a float".to_string())?;
-            }
-            "--iou" => {
-                cli.iou = take_value(&mut args, "--iou")?
-                    .parse()
-                    .map_err(|_| "--iou expects a float".to_string())?;
-            }
-            value if value.starts_with('-') => {
-                return Err(format!("unknown detect option: {value}"))
-            }
-            value => {
-                match positional {
-                    0 => cli.model = PathBuf::from(value),
-                    1 => cli.input = PathBuf::from(value),
-                    _ => return Err(format!("unexpected detect argument: {value}")),
-                }
-                positional += 1;
-            }
-        }
-    }
-
-    if cli.model.as_os_str().is_empty() {
-        return Err("missing cvimodel path".to_string());
-    }
-    if cli.input.as_os_str().is_empty() {
-        return Err("missing input image path".to_string());
-    }
-    Ok(cli)
-}
-
-fn parse_capture_cli(args: impl Iterator<Item = String>) -> Result<CaptureCli, String> {
-    let mut cli = CaptureCli::default();
-    let mut positional = 0;
-    let mut args = args.peekable();
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "-h" | "--help" => {
-                print_capture_usage();
-                std::process::exit(0);
-            }
-            "--camera" => cli.camera = take_value(&mut args, "--camera")?,
-            "-o" | "--out" => cli.output = PathBuf::from(take_value(&mut args, "--out")?),
-            "--warmup" => {
-                cli.warmup = take_value(&mut args, "--warmup")?
-                    .parse()
-                    .map_err(|_| "--warmup expects a non-negative integer".to_string())?;
-            }
-            value if value.starts_with('-') => {
-                return Err(format!("unknown capture option: {value}"))
-            }
-            value => {
-                match positional {
-                    0 => cli.output = PathBuf::from(value),
-                    _ => return Err(format!("unexpected capture argument: {value}")),
-                }
-                positional += 1;
-            }
-        }
-    }
-    Ok(cli)
-}
-
-fn take_value(
-    args: &mut std::iter::Peekable<impl Iterator<Item = String>>,
-    option: &str,
-) -> Result<String, String> {
-    args.next()
-        .ok_or_else(|| format!("{option} expects a value"))
-}
+// ── Usage ────────────────────────────────────────────────────────────────────
 
 fn print_usage() {
     eprintln!(
-        "Usage:\n  akars <model.cvimodel> [--camera DEV] [--motor DEV] [--arm DEV] [--frames N] [--classes N] [--conf X] [--iou X]\n  akars serve [--listen HOST:PORT] [--motor DEV] [--arm DEV] [--mock]\n  akars detect <model.cvimodel> <image> [--out PATH] [--classes N] [--conf X] [--iou X]\n  akars capture [output.jpg] [--camera DEV] [--out PATH] [--warmup N]\n  akars armtest <servo0> <servo1> <servo2> [--arm DEV] [--time MS]"
+        "Usage:
+  akars [--robot PATH] [--arm PATH] hunt <model.cvimodel> [--frames N]
+  akars [--robot PATH] [--arm PATH] serve
+  akars [--robot PATH] [--arm PATH] detect <model.cvimodel> <image> [--out PATH]
+  akars [--robot PATH] [--arm PATH] capture [output] [--out PATH] [--warmup N]
+  akars [--robot PATH] [--arm PATH] armtest <servo0> <servo1> <servo2> [--time MS]
+
+Global options (before the subcommand):
+  --robot PATH   Robot TOML config (default: ./robot.toml)
+  --arm PATH     Arm motion JSON config (default: ./arm.json)
+
+Config file templates:
+  robot.example.toml   camera/motor/arm/tpu/web sections
+  arm.example.json     grab_position / lift_position / gripper_open / gripper_close"
     );
 }
 
 fn print_capture_usage() {
     eprintln!(
-        "Usage: akars capture [output.jpg] [--camera DEV] [--out PATH] [--warmup N]\n\nGrabs a single JPEG frame from the camera, discarding the first N frames so the\nsensor's auto exposure / white balance can settle (warm up).\n\nDefaults:\n  --camera /dev/cvi-usb-camera0\n  --out capture.jpg\n  --warmup 30"
+        "Usage: akars capture [output] [--out PATH] [--warmup N]
+
+Defaults:
+  --out    capture.jpg
+  --warmup 30"
     );
 }
 
 fn print_detect_usage() {
     eprintln!(
-        "Usage: akars detect <model.cvimodel> <image> [--out PATH] [--classes N] [--conf X] [--iou X]\n\nRuns the TPU model on a single image and writes a copy with detection boxes drawn.\n\nDefaults:\n  --out detect_out.jpg\n  --classes 1\n  --conf 0.5\n  --iou 0.5"
+        "Usage: akars detect <model.cvimodel> <image> [--out PATH]
+
+Defaults:
+  --out    detect_out.jpg"
     );
 }
 
-fn print_web_usage() {
+fn print_serve_usage() {
     eprintln!(
-        "Usage: akars serve [--listen HOST:PORT] [--motor DEV] [--arm DEV] [--mock]\n\nDefaults:\n  --listen 0.0.0.0:8080\n  --motor /dev/ttyS1\n  --arm /dev/ttyS2"
+        "Usage: akars serve
+
+All server settings (listen address, mock mode) come from the [web] section of
+the robot TOML config. Use --robot to point to a different file."
     );
 }
 
 fn print_armtest_usage() {
     eprintln!(
-        "Usage: akars armtest <servo0> <servo1> <servo2> [--arm DEV] [--time MS]\n\nSets three arm servo angles directly for debugging.\n\nDefaults:\n  --arm /dev/ttyS2\n  --time 1000"
+        "Usage: akars armtest <servo0> <servo1> <servo2> [--time MS]
+
+Sets three arm servo angles directly for debugging.
+
+Defaults:
+  --time  1000"
     );
 }

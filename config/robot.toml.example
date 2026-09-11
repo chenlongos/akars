@@ -1,0 +1,25 @@
+[camera]
+  DEVICE = "/dev/video0"
+  FRAME_WIDTH = 640
+  FRAME_HEIGHT = 480
+
+[motor]
+  PORT = "/dev/ttyS1"
+  BAUDRATE = 115200
+  SPEED_SCALE = 85
+  PPR = 4680
+  PWM_FREQ = 20000
+  MIN_SPEED = 15
+
+[arm]
+  PORT = "/dev/ttyS2"
+  BAUDRATE = 115200
+
+[tpu]
+  CLASSES_NUM = 1
+  CONFIDENCE_THRESHOLD = 0.5
+  IOU_THRESHOLD = 0.5
+
+[web]
+  LISTEN = "0.0.0.0:8080"
+  MOCK = false

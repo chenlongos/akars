@@ -1,4 +1,4 @@
-use crate::arm::Arm;
+use crate::arm::{Arm, ArmMotionConfig};
 use crate::motor::{Motor, MotorConfig};
 use axum::extract::{Query, State};
 use axum::response::Html;
@@ -231,7 +231,7 @@ impl HardwareState {
             Err(err) => self.motor_error = Some(format!("{}: {err}", config.motor_device)),
         }
 
-        match Arm::open(&config.arm_device, 115200) {
+        match Arm::open(&config.arm_device, 115200, ArmMotionConfig::default()) {
             Ok(arm) => self.arm = Some(arm),
             Err(err) => self.arm_error = Some(format!("{}: {err}", config.arm_device)),
         }

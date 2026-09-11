@@ -18,6 +18,7 @@ const RSP_ACK: u8 = 0x80;
 #[derive(Debug, Clone)]
 pub struct MotorConfig {
     pub device: String,
+    pub baudrate: i32,
     pub speed_scale: i32,
     pub ppr: u16,
     pub pwm_freq: u16,
@@ -28,6 +29,7 @@ impl Default for MotorConfig {
     fn default() -> Self {
         Self {
             device: "/dev/ttyS1".to_string(),
+            baudrate: 115200,
             speed_scale: 85,
             ppr: 4680,
             pwm_freq: 20000,
@@ -47,7 +49,7 @@ impl Motor {
         // The UART pads need muxing before the port will physically transmit;
         // the device tree enables UART1 but leaves its pins unrouted.
         crate::pinmux::configure_for_device(&config.device);
-        let port = SerialPort::open(&config.device, 115200, true)?;
+        let port = SerialPort::open(&config.device, config.baudrate, true)?;
         eprintln!("[dbg][motor] port opened, sleeping 100ms");
         thread::sleep(Duration::from_millis(100));
         port.flush();
