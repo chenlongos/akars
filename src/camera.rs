@@ -1,11 +1,8 @@
 //! V4L2 摄像头采集（mmap + poll 模式）。
 //!
 //! 与 C++ 示例（`example_of_softlink/csrc/src/camera.cpp`）采用完全相同的
-//! V4L2 流程：QUERYCAP → 协商格式 (MJPEG 优先, YUYV 回退) → REQBUFS →
+//! V4L2 流程：QUERYCAP → 协商格式 (YUYV 优先, MJPEG 回退) → REQBUFS →
 //! QUERYBUF/mmap → QBUF 预热 → STREAMON → poll + DQBUF/QBUF 取流。
-//!
-//! 阻塞式 `get_frame()` 接口与旧版兼容，`CameraFrame` 中 `pixels` 是
-//! MJPEG 字节流（或协商到的其他压缩格式）。
 
 use crate::v4l2;
 use std::ffi::c_void;
@@ -15,7 +12,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
-const V4L2_NUM_BUFFERS: u32 = 3; // 3 缓冲比 2 更稳
+const V4L2_NUM_BUFFERS: u32 = 3;
 const POLL_TIMEOUT_MS: i32 = 1000;
 
 #[derive(Clone, Copy, Debug)]
@@ -37,7 +34,6 @@ impl CameraInfo {
 
 #[derive(Debug)]
 pub struct CameraFrame {
-    /// MJPEG 字节流（或协商到的其他格式）。
     pub pixels: Vec<u8>,
     pub width: u32,
     pub height: u32,
@@ -91,15 +87,16 @@ impl UsbCamera {
         };
         eprintln!("[camera] V4L2 driver={driver} card={card}");
 
-        // ── 2. 协商格式（MJPEG 优先, YUYV 回退） ────────────────────────
+        // ── 2. 协商格式（YUYV 优先, MJPEG 回退） ────────────────────────
+        // YUYV→RGB 是纯 CPU 计算（比 MJPEG 解码快得多），先试 YUYV。
         let mut width = 640u32;
         let mut height = 480u32;
-        let mut pixelformat = v4l2::V4L2_PIX_FMT_MJPEG;
+        let mut pixelformat = v4l2::V4L2_PIX_FMT_YUYV;
 
         let mut fmt_set = try_set_format(fd, pixelformat, width, height)?;
         if fmt_set.pixelformat != pixelformat {
-            eprintln!("[camera] MJPEG not supported, trying YUYV");
-            pixelformat = v4l2::V4L2_PIX_FMT_YUYV;
+            eprintln!("[camera] YUYV not supported, trying MJPEG");
+            pixelformat = v4l2::V4L2_PIX_FMT_MJPEG;
             fmt_set = try_set_format(fd, pixelformat, width, height)?;
         }
         width = fmt_set.width;
@@ -196,8 +193,6 @@ impl UsbCamera {
             buf.type_ = v4l2::V4L2_BUF_TYPE_VIDEO_CAPTURE;
             buf.memory = v4l2::V4L2_MEMORY_MMAP;
             let dq_ret = v4l2::ioctl_ptr(fd, v4l2::VIDIOC_DQBUF, &mut buf);
-
-            // 如果是 EAGAIN，说明 poll 返回了但实际没数据（竞态），重新 poll
             if let Err(ref e) = dq_ret {
                 if e.kind() == io::ErrorKind::WouldBlock {
                     continue;
@@ -207,7 +202,6 @@ impl UsbCamera {
 
             let idx = buf.index as usize;
             if idx >= self.buffers.len() {
-                // 这是异常情况，QBUF 回去再重试
                 let _ = v4l2::ioctl_ptr(fd, v4l2::VIDIOC_QBUF, &mut buf);
                 return Err(io::Error::new(
                     io::ErrorKind::Other,
@@ -218,19 +212,16 @@ impl UsbCamera {
             let mmap_buf = &self.buffers[idx];
             let bytesused = buf.bytesused as usize;
             if bytesused == 0 || bytesused > mmap_buf.len {
-                // QBUF 回去再重试
                 let _ = v4l2::ioctl_ptr(fd, v4l2::VIDIOC_QBUF, &mut buf);
                 continue;
             }
 
-            // 拷贝帧数据
             let data_ptr = mmap_buf.ptr as *const u8;
             let mut pixels = vec![0u8; bytesused];
             unsafe {
                 std::ptr::copy_nonoverlapping(data_ptr, pixels.as_mut_ptr(), bytesused);
             }
 
-            // QBUF 回去
             let _ = v4l2::ioctl_ptr(fd, v4l2::VIDIOC_QBUF, &mut buf);
 
             return Ok(CameraFrame {
@@ -253,7 +244,6 @@ impl Drop for UsbCamera {
             );
             self.running = false;
         }
-        // mmap 由 MmapBuf Drop 负责
         for buf in self.buffers.drain(..) {
             let _ = v4l2::munmap_buffer(buf.ptr, buf.len);
         }
@@ -288,8 +278,6 @@ fn fmt_name(pixelformat: u32) -> &'static str {
     }
 }
 
-// ── 旧接口的 JPEG 辅助（保留以兼容旧的 image_bridge 测试） ──────────────────
-
 pub fn is_valid_jpeg(data: &[u8]) -> bool {
     data.len() >= 4
         && data.starts_with(&[0xFF, 0xD8])
@@ -307,5 +295,3 @@ mod tests {
         assert!(!is_valid_jpeg(&[0xFF, 0xD8, 1]));
     }
 }
-
-
