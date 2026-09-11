@@ -140,6 +140,7 @@ pub fn run_tennis_hunter(
     }
     let mut rgb_planar = vec![0u8; rgb_len];
     let mut preprocessor = ImagePreprocessor::new();
+    let cam_info = camera.info();
 
     arm.grab_pos();
 
@@ -164,10 +165,26 @@ pub fn run_tennis_hunter(
         let capture_us = capture_start.elapsed().as_micros() as i64;
 
         let preprocess_start = Instant::now();
-        match preprocessor.mjpeg_to_rgb_planar(&frame.pixels, &mut rgb_planar, model_w, model_h) {
+        let preprocess_res = match cam_info.pixelformat {
+            crate::v4l2::V4L2_PIX_FMT_MJPEG => {
+                preprocessor.mjpeg_to_rgb_planar(&frame.pixels, &mut rgb_planar, model_w, model_h)
+            }
+            crate::v4l2::V4L2_PIX_FMT_YUYV => crate::image_bridge::yuyv_to_rgb_planar(
+                &frame.pixels,
+                &mut rgb_planar,
+                cam_info.width as i32,
+                cam_info.height as i32,
+                model_w,
+                model_h,
+            ),
+            _ => Err(crate::image_bridge::ImageBridgeError::InvalidInput(
+                "unsupported camera pixelformat",
+            )),
+        };
+        match preprocess_res {
             Ok(_) => {}
             Err(err) => {
-                eprintln!("[pre] MJPEG preprocess failed: {err}");
+                eprintln!("[pre] preprocess failed: {err}");
                 continue;
             }
         }

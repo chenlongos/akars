@@ -66,7 +66,7 @@ impl Default for Cli {
         Self {
             model: PathBuf::new(),
             camera: "/dev/video0".to_string(),
-            motor: "/dev/ttyS3".to_string(),
+            motor: "/dev/ttyS1".to_string(),
             arm: "/dev/ttyS2".to_string(),
             frames: None,
             classes: 1,
@@ -575,7 +575,7 @@ fn print_detect_usage() {
 
 fn print_web_usage() {
     eprintln!(
-        "Usage: akars serve [--listen HOST:PORT] [--motor DEV] [--arm DEV] [--mock]\n\nDefaults:\n  --listen 0.0.0.0:8080\n  --motor /dev/ttyS3\n  --arm /dev/ttyS2"
+        "Usage: akars serve [--listen HOST:PORT] [--motor DEV] [--arm DEV] [--mock]\n\nDefaults:\n  --listen 0.0.0.0:8080\n  --motor /dev/ttyS1\n  --arm /dev/ttyS2"
     );
 }
 

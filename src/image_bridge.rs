@@ -217,6 +217,154 @@ fn yuv422p_to_rgb_planar_scalar(
     }
 }
 
+// ── YUYV (packed 4:2:2) → RGB planar + letterbox ──────────────────────────
+
+/// Convert a YUYV packed (interleaved 4:2:2) frame to an RGB planar tensor,
+/// with optional letterbox resizing if source ≠ destination dimensions.
+///
+/// YUYV layout: each 4-byte group encodes 2 pixels as `[Y0, U, Y1, V]`.
+/// Two horizontally adjacent pixels share one U and one V sample.
+/// Uses the same BT.601 full-range coefficients as the I422 path above,
+/// so model input distribution stays consistent across all capture formats.
+pub fn yuyv_to_rgb_planar(
+    yuyv: &[u8],
+    dst: &mut [u8],
+    src_w: i32,
+    src_h: i32,
+    dst_w: i32,
+    dst_h: i32,
+) -> Result<ImagePreprocessTiming, ImageBridgeError> {
+    let (sw, sh) = valid_dimensions(src_w, src_h)?;
+    let sw = sw as usize;
+    let sh = sh as usize;
+    if (sw & 1) != 0 {
+        return Err(ImageBridgeError::InvalidInput(
+            "YUYV conversion requires an even source width",
+        ));
+    }
+    let expected = sw * sh * 2;
+    if yuyv.len() < expected {
+        return Err(ImageBridgeError::InvalidInput(
+            "YUYV input smaller than expected",
+        ));
+    }
+    let (dw, dh) = valid_dimensions(dst_w, dst_h)?;
+    let dw = dw as usize;
+    let dh = dh as usize;
+    let channel_size = checked_image_len(dw as u32, dh as u32, 1)?;
+    let required = checked_image_len(dw as u32, dh as u32, 3)?;
+    if dst.len() < required {
+        return Err(ImageBridgeError::InvalidInput(
+            "destination tensor buffer is too small",
+        ));
+    }
+
+    let timing = if sw == dw && sh == dh {
+        yuyv_to_rgb_planar_scalar(yuyv, dst, sw, sh);
+        ImagePreprocessTiming {
+            src_w: src_w,
+            src_h: src_h,
+            decode_us: 0,
+            resize_us: 0,
+        }
+    } else {
+        let mut rgb_src = vec![0u8; sw * sh * 3];
+        yuyv_to_rgb8(yuyv, &mut rgb_src, sw, sh);
+
+        let scale = (dw as f64 / sw as f64).min(dh as f64 / sh as f64);
+        let resized_w = ((sw as f64 * scale) as u32).max(1);
+        let resized_h = ((sh as f64 * scale) as u32).max(1);
+        let pad_left = (dw - resized_w as usize) / 2;
+        let pad_top = (dh - resized_h as usize) / 2;
+
+        clear_letterbox_padding(
+            dst, dw as u32, dh as u32,
+            resized_w, resized_h, channel_size, pad_left as u32, pad_top as u32,
+        );
+
+        let mut x_cache = InterpolationCache::default();
+        let mut y_cache = InterpolationCache::default();
+        resize_pack_rgb_planar(
+            &rgb_src, sw as u32, sh as u32,
+            dst, dw as u32, resized_w, resized_h, channel_size,
+            pad_left as u32, pad_top as u32,
+            &mut x_cache, &mut y_cache,
+        );
+
+        ImagePreprocessTiming {
+            src_w: src_w,
+            src_h: src_h,
+            decode_us: 0,
+            resize_us: 0,
+        }
+    };
+
+    Ok(timing)
+}
+
+/// In-place YUYV → RGB planar, no resize. src RGB pixels go straight into
+/// R/G/B planes. BT.601 full-range JFIF coefficients (same as I422 path).
+fn yuyv_to_rgb_planar_scalar(yuyv: &[u8], dst: &mut [u8], w: usize, h: usize) {
+    let plane = w * h;
+    let (r_plane, rest) = dst.split_at_mut(plane);
+    let (g_plane, b_plane) = rest.split_at_mut(plane);
+
+    for row in 0..h {
+        let yuyv_row = row * w * 2;
+        for pair in 0..(w / 2) {
+            let src_idx = yuyv_row + pair * 4;
+            let y0 = yuyv[src_idx] as i32;
+            let u = yuyv[src_idx + 1] as i32 - 128;
+            let y1 = yuyv[src_idx + 2] as i32;
+            let v = yuyv[src_idx + 3] as i32 - 128;
+
+            let r_uv = (91881 * v) >> 16;
+            let g_uv = (22554 * u + 46802 * v) >> 16;
+            let b_uv = (116130 * u) >> 16;
+
+            let out0 = row * w + pair * 2;
+            r_plane[out0]     = clamp_u8(y0 + r_uv);
+            g_plane[out0]     = clamp_u8(y0 - g_uv);
+            b_plane[out0]     = clamp_u8(y0 + b_uv);
+
+            let out1 = out0 + 1;
+            r_plane[out1]     = clamp_u8(y1 + r_uv);
+            g_plane[out1]     = clamp_u8(y1 - g_uv);
+            b_plane[out1]     = clamp_u8(y1 + b_uv);
+        }
+    }
+}
+
+/// YUYV → RGB interleaved packed (R G B R G B ...). Used as the intermediate
+/// when the model input size differs from the camera resolution.
+fn yuyv_to_rgb8(yuyv: &[u8], rgb: &mut [u8], w: usize, h: usize) {
+    for row in 0..h {
+        let yuyv_row = row * w * 2;
+        let rgb_row = row * w * 3;
+        for pair in 0..(w / 2) {
+            let src_idx = yuyv_row + pair * 4;
+            let y0 = yuyv[src_idx] as i32;
+            let u = yuyv[src_idx + 1] as i32 - 128;
+            let y1 = yuyv[src_idx + 2] as i32;
+            let v = yuyv[src_idx + 3] as i32 - 128;
+
+            let r_uv = (91881 * v) >> 16;
+            let g_uv = (22554 * u + 46802 * v) >> 16;
+            let b_uv = (116130 * u) >> 16;
+
+            let out0 = rgb_row + pair * 6;
+            rgb[out0]     = clamp_u8(y0 + r_uv);
+            rgb[out0 + 1] = clamp_u8(y0 - g_uv);
+            rgb[out0 + 2] = clamp_u8(y0 + b_uv);
+
+            let out1 = out0 + 3;
+            rgb[out1]     = clamp_u8(y1 + r_uv);
+            rgb[out1 + 1] = clamp_u8(y1 - g_uv);
+            rgb[out1 + 2] = clamp_u8(y1 + b_uv);
+        }
+    }
+}
+
 /// Convert an I422 frame to RGB and save it as an image (format inferred from
 /// the output path extension). Handy for inspecting the raw YUV camera path.
 pub fn save_yuv422p(

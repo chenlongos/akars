@@ -75,15 +75,16 @@ pub struct v4l2_pix_format {
 // size check: 48 ✓
 
 /// v4l2_format 的 fmt union 包含指针类型成员 (v4l2_window.rects)，
-/// 因此在 x86_64 上对齐要求是 8 字节。
-#[repr(C)]
+/// 因此在 x86_64 上对齐要求是 8 字节。显式标注 align(8)，
+/// 避免 Rust 仅根据我们声明的成员（pix + raw_data）推断对齐为 4。
+#[repr(C, align(8))]
 pub union v4l2_format_fmt {
     pub pix: v4l2_pix_format,
     pub raw_data: [u8; 200],
 }
-// union alignment = 8 (due to v4l2_window containing pointers)
+// union alignment = 8 ✓（加上显式标注）
 
-#[repr(C, align(8))]
+#[repr(C)]
 pub struct v4l2_format {
     pub type_: u32,
     /// fmt 的对齐是 8，所以 type_ 之后需要 4 字节 padding 才能放在 offset 8。
