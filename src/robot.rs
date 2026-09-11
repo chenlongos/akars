@@ -1,7 +1,7 @@
 use crate::arm::Arm;
 use crate::camera::UsbCamera;
 use crate::detector::Detection;
-use crate::image_bridge;
+use crate::image_bridge::ImagePreprocessor;
 use crate::motor::Motor;
 use crate::tpu::{InferTiming, InferenceConfig, YoloModel};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -139,6 +139,7 @@ pub fn run_tennis_hunter(
         return;
     }
     let mut rgb_planar = vec![0u8; rgb_len];
+    let mut preprocessor = ImagePreprocessor::new();
 
     arm.grab_pos();
 
@@ -163,11 +164,12 @@ pub fn run_tennis_hunter(
         let capture_us = capture_start.elapsed().as_micros() as i64;
 
         let preprocess_start = Instant::now();
-        if let Err(err) =
-            image_bridge::yuv422p_to_rgb_planar(&frame.pixels, &mut rgb_planar, model_w, model_h)
-        {
-            eprintln!("[pre] YUV preprocess failed: {err}");
-            continue;
+        match preprocessor.mjpeg_to_rgb_planar(&frame.pixels, &mut rgb_planar, model_w, model_h) {
+            Ok(_) => {}
+            Err(err) => {
+                eprintln!("[pre] MJPEG preprocess failed: {err}");
+                continue;
+            }
         }
         let preprocess_us = preprocess_start.elapsed().as_micros() as i64;
 

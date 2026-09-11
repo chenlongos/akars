@@ -65,7 +65,7 @@ impl Default for Cli {
     fn default() -> Self {
         Self {
             model: PathBuf::new(),
-            camera: "/dev/cvi-usb-camera0".to_string(),
+            camera: "/dev/video0".to_string(),
             motor: "/dev/ttyS3".to_string(),
             arm: "/dev/ttyS2".to_string(),
             frames: None,
@@ -92,7 +92,7 @@ impl Default for DetectCli {
 impl Default for CaptureCli {
     fn default() -> Self {
         Self {
-            camera: "/dev/cvi-usb-camera0".to_string(),
+            camera: "/dev/video0".to_string(),
             output: PathBuf::from("capture.jpg"),
             warmup: 30,
         }
@@ -167,8 +167,8 @@ fn run_hunt(cli: Cli) {
         Ok(camera) => {
             let info = camera.info();
             eprintln!(
-                "[camera] opened {}: {}x{} format={} connected={}",
-                cli.camera, info.width, info.height, info.format, info.connected
+                "[camera] opened {}: {}x{} format={}",
+                cli.camera, info.width, info.height, info.format_name()
             );
             camera
         }
@@ -274,8 +274,8 @@ fn run_capture(cli: CaptureCli) {
         Ok(camera) => {
             let info = camera.info();
             eprintln!(
-                "[capture] opened {}: {}x{} format={} connected={}",
-                cli.camera, info.width, info.height, info.format, info.connected
+                "[capture] opened {}: {}x{} format={}",
+                cli.camera, info.width, info.height, info.format_name()
             );
             camera
         }
@@ -305,20 +305,17 @@ fn run_capture(cli: CaptureCli) {
         }
     };
 
-    if let Err(err) = akars::image_bridge::save_yuv422p(
-        &frame.pixels,
-        frame.width as i32,
-        frame.height as i32,
-        &cli.output,
-    ) {
+    // MJPEG 字节流直接写入文件
+    if let Err(err) = std::fs::write(&cli.output, &frame.pixels) {
         eprintln!("[capture] failed to write {}: {err}", cli.output.display());
         std::process::exit(1);
     }
 
     eprintln!(
-        "[capture] wrote {}x{} frame to {}",
+        "[capture] wrote {}x{} frame ({} bytes) to {}",
         frame.width,
         frame.height,
+        frame.pixels.len(),
         cli.output.display()
     );
 }

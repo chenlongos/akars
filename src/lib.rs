@@ -8,4 +8,5 @@ pub mod pinmux;
 pub mod robot;
 pub mod serial;
 pub mod tpu;
+pub mod v4l2;
 pub mod web;

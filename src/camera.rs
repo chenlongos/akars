@@ -1,62 +1,60 @@
-use crate::linux;
+//! V4L2 摄像头采集（mmap + poll 模式）。
+//!
+//! 与 C++ 示例（`example_of_softlink/csrc/src/camera.cpp`）采用完全相同的
+//! V4L2 流程：QUERYCAP → 协商格式 (MJPEG 优先, YUYV 回退) → REQBUFS →
+//! QUERYBUF/mmap → QBUF 预热 → STREAMON → poll + DQBUF/QBUF 取流。
+//!
+//! 阻塞式 `get_frame()` 接口与旧版兼容，`CameraFrame` 中 `pixels` 是
+//! MJPEG 字节流（或协商到的其他压缩格式）。
+
+use crate::v4l2;
+use std::ffi::c_void;
 use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
-const CVI_CAMERA_IOCTL_INIT: u64 = 1;
-const CVI_CAMERA_IOCTL_GET_INFO: u64 = 2;
-// cmd 4: kernel returns a raw YUV422 planar (I422) frame instead of MJPEG.
-const CVI_CAMERA_IOCTL_GET_FRAME: u64 = 4;
-const YUV_FRAME_WIDTH: usize = 640;
-const YUV_FRAME_HEIGHT: usize = 480;
-// I422: full-size Y plane + U and V planes each subsampled horizontally (w/2 × h).
-const YUV_FRAME_SIZE: usize = YUV_FRAME_WIDTH * YUV_FRAME_HEIGHT * 2;
-const JPEG_MARKER_START: [u8; 2] = [0xFF, 0xD8];
-const JPEG_MARKER_END: [u8; 2] = [0xFF, 0xD9];
-
-#[repr(C, packed)]
-#[derive(Clone, Copy, Default)]
-struct RawCameraInfo {
-    width: u16,
-    height: u16,
-    format: u8,
-    connected: u8,
-}
+const V4L2_NUM_BUFFERS: u32 = 3; // 3 缓冲比 2 更稳
+const POLL_TIMEOUT_MS: i32 = 1000;
 
 #[derive(Clone, Copy, Debug)]
 pub struct CameraInfo {
-    pub width: u16,
-    pub height: u16,
-    pub format: u8,
-    pub connected: bool,
+    pub width: u32,
+    pub height: u32,
+    pub pixelformat: u32,
 }
 
-impl RawCameraInfo {
-    fn unpack(&self) -> CameraInfo {
-        let width = unsafe { std::ptr::addr_of!(self.width).read_unaligned() };
-        let height = unsafe { std::ptr::addr_of!(self.height).read_unaligned() };
-        CameraInfo {
-            width,
-            height,
-            format: self.format,
-            connected: self.connected != 0,
+impl CameraInfo {
+    pub fn format_name(&self) -> &'static str {
+        match self.pixelformat {
+            v4l2::V4L2_PIX_FMT_MJPEG => "MJPEG",
+            v4l2::V4L2_PIX_FMT_YUYV => "YUYV",
+            _ => "unknown",
         }
     }
 }
 
 #[derive(Debug)]
 pub struct CameraFrame {
-    /// Raw YUV422 planar (I422) pixels: Y plane, then U plane, then V plane.
+    /// MJPEG 字节流（或协商到的其他格式）。
     pub pixels: Vec<u8>,
-    pub width: u16,
-    pub height: u16,
+    pub width: u32,
+    pub height: u32,
 }
+
+struct MmapBuf {
+    ptr: *mut c_void,
+    len: usize,
+}
+unsafe impl Send for MmapBuf {}
+unsafe impl Sync for MmapBuf {}
 
 pub struct UsbCamera {
     file: File,
     info: CameraInfo,
+    buffers: Vec<MmapBuf>,
+    running: bool,
 }
 
 impl UsbCamera {
@@ -64,32 +62,114 @@ impl UsbCamera {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .custom_flags(linux::O_NOCTTY)
+            .custom_flags(v4l2::O_NONBLOCK)
             .open(path.as_ref())?;
+        let fd = file.as_raw_fd();
 
-        ioctl_no_arg(file.as_raw_fd(), CVI_CAMERA_IOCTL_INIT)?;
-
-        let mut raw = RawCameraInfo::default();
-        ioctl_ptr(
-            file.as_raw_fd(),
-            CVI_CAMERA_IOCTL_GET_INFO,
-            &mut raw as *mut RawCameraInfo,
-        )?;
-        let info = raw.unpack();
-        if !info.connected {
+        // ── 1. QUERYCAP ──────────────────────────────────────────────────
+        let mut cap = v4l2::v4l2_capability::default();
+        v4l2::ioctl_ptr(fd, v4l2::VIDIOC_QUERYCAP, &mut cap)?;
+        if (cap.capabilities & v4l2::V4L2_CAP_VIDEO_CAPTURE) == 0 {
             return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "camera reports disconnected",
+                io::ErrorKind::Unsupported,
+                "device is not a video capture device",
             ));
         }
-        if info.format != 1 {
-            eprintln!(
-                "[camera] warning: camera format {} is not MJPEG(1)",
-                info.format
-            );
+        if (cap.capabilities & v4l2::V4L2_CAP_STREAMING) == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "device does not support streaming",
+            ));
+        }
+        let driver = {
+            let nul = cap.driver.iter().position(|&b| b == 0).unwrap_or(cap.driver.len());
+            String::from_utf8_lossy(&cap.driver[..nul]).into_owned()
+        };
+        let card = {
+            let nul = cap.card.iter().position(|&b| b == 0).unwrap_or(cap.card.len());
+            String::from_utf8_lossy(&cap.card[..nul]).into_owned()
+        };
+        eprintln!("[camera] V4L2 driver={driver} card={card}");
+
+        // ── 2. 协商格式（MJPEG 优先, YUYV 回退） ────────────────────────
+        let mut width = 640u32;
+        let mut height = 480u32;
+        let mut pixelformat = v4l2::V4L2_PIX_FMT_MJPEG;
+
+        let mut fmt_set = try_set_format(fd, pixelformat, width, height)?;
+        if fmt_set.pixelformat != pixelformat {
+            eprintln!("[camera] MJPEG not supported, trying YUYV");
+            pixelformat = v4l2::V4L2_PIX_FMT_YUYV;
+            fmt_set = try_set_format(fd, pixelformat, width, height)?;
+        }
+        width = fmt_set.width;
+        height = fmt_set.height;
+        pixelformat = fmt_set.pixelformat;
+        eprintln!(
+            "[camera] negotiated {} {}x{} sizeimage={}",
+            fmt_name(pixelformat),
+            width,
+            height,
+            fmt_set.sizeimage
+        );
+
+        // ── 3. REQBUFS ──────────────────────────────────────────────────
+        let mut req = v4l2::v4l2_requestbuffers::default();
+        req.count = V4L2_NUM_BUFFERS;
+        req.type_ = v4l2::V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        req.memory = v4l2::V4L2_MEMORY_MMAP;
+        v4l2::ioctl_ptr(fd, v4l2::VIDIOC_REQBUFS, &mut req)?;
+        if req.count < 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("REQBUFS returned only {} buffers", req.count),
+            ));
+        }
+        eprintln!("[camera] REQBUFS count={}", req.count);
+
+        // ── 4. QUERYBUF + mmap ───────────────────────────────────────────
+        let mut buffers = Vec::with_capacity(req.count as usize);
+        for i in 0..req.count {
+            let mut buf = v4l2::v4l2_buffer::default();
+            buf.index = i;
+            buf.type_ = v4l2::V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            buf.memory = v4l2::V4L2_MEMORY_MMAP;
+            v4l2::ioctl_ptr(fd, v4l2::VIDIOC_QUERYBUF, &mut buf)?;
+            let offset = unsafe { buf.m.offset } as u64;
+            let ptr = v4l2::mmap_buffer(fd, buf.length as usize, offset)?;
+            buffers.push(MmapBuf {
+                ptr,
+                len: buf.length as usize,
+            });
         }
 
-        Ok(Self { file, info })
+        // ── 5. QBUF 预热 ────────────────────────────────────────────────
+        for i in 0..req.count {
+            let mut buf = v4l2::v4l2_buffer::default();
+            buf.index = i;
+            buf.type_ = v4l2::V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            buf.memory = v4l2::V4L2_MEMORY_MMAP;
+            v4l2::ioctl_ptr(fd, v4l2::VIDIOC_QBUF, &mut buf)?;
+        }
+
+        // ── 6. STREAMON ─────────────────────────────────────────────────
+        v4l2::ioctl_u32_ptr(
+            fd,
+            v4l2::VIDIOC_STREAMON,
+            v4l2::V4L2_BUF_TYPE_VIDEO_CAPTURE,
+        )?;
+        eprintln!("[camera] stream ON");
+
+        Ok(Self {
+            file,
+            info: CameraInfo {
+                width,
+                height,
+                pixelformat,
+            },
+            buffers,
+            running: true,
+        })
     }
 
     pub fn info(&self) -> CameraInfo {
@@ -97,59 +177,123 @@ impl UsbCamera {
     }
 
     pub fn get_frame(&mut self) -> io::Result<CameraFrame> {
-        let mut buffer = vec![0u8; YUV_FRAME_SIZE];
-        let ret = unsafe {
-            linux::ioctl(
-                self.file.as_raw_fd(),
-                CVI_CAMERA_IOCTL_GET_FRAME as _,
-                buffer.as_mut_ptr(),
-            )
-        };
-        if ret < 0 {
-            return Err(io::Error::last_os_error());
+        let fd = self.file.as_raw_fd();
+        loop {
+            let pollfd = v4l2::pollfd {
+                fd,
+                events: v4l2::POLLIN,
+                revents: 0,
+            };
+            let ret = v4l2::poll(&mut [pollfd], POLL_TIMEOUT_MS)?;
+            if ret == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "camera poll timeout",
+                ));
+            }
+
+            let mut buf = v4l2::v4l2_buffer::default();
+            buf.type_ = v4l2::V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            buf.memory = v4l2::V4L2_MEMORY_MMAP;
+            let dq_ret = v4l2::ioctl_ptr(fd, v4l2::VIDIOC_DQBUF, &mut buf);
+
+            // 如果是 EAGAIN，说明 poll 返回了但实际没数据（竞态），重新 poll
+            if let Err(ref e) = dq_ret {
+                if e.kind() == io::ErrorKind::WouldBlock {
+                    continue;
+                }
+                dq_ret?;
+            }
+
+            let idx = buf.index as usize;
+            if idx >= self.buffers.len() {
+                // 这是异常情况，QBUF 回去再重试
+                let _ = v4l2::ioctl_ptr(fd, v4l2::VIDIOC_QBUF, &mut buf);
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("DQBUF index {} out of range (nbufs={})", idx, self.buffers.len()),
+                ));
+            }
+
+            let mmap_buf = &self.buffers[idx];
+            let bytesused = buf.bytesused as usize;
+            if bytesused == 0 || bytesused > mmap_buf.len {
+                // QBUF 回去再重试
+                let _ = v4l2::ioctl_ptr(fd, v4l2::VIDIOC_QBUF, &mut buf);
+                continue;
+            }
+
+            // 拷贝帧数据
+            let data_ptr = mmap_buf.ptr as *const u8;
+            let mut pixels = vec![0u8; bytesused];
+            unsafe {
+                std::ptr::copy_nonoverlapping(data_ptr, pixels.as_mut_ptr(), bytesused);
+            }
+
+            // QBUF 回去
+            let _ = v4l2::ioctl_ptr(fd, v4l2::VIDIOC_QBUF, &mut buf);
+
+            return Ok(CameraFrame {
+                pixels,
+                width: self.info.width,
+                height: self.info.height,
+            });
         }
- 
-        // eprintln!("[camera] ioctl returned {ret} bytes");
-        // The kernel may signal success with 0 or report the byte count; either
-        // way we expect one full I420 frame in the buffer.
-        let size = ret as usize;
+    }
+}
 
-        if size != 0 && size < YUV_FRAME_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "camera returned a short YUV frame",
-            ));
+impl Drop for UsbCamera {
+    fn drop(&mut self) {
+        if self.running {
+            let fd = self.file.as_raw_fd();
+            let _ = v4l2::ioctl_u32_ptr(
+                fd,
+                v4l2::VIDIOC_STREAMOFF,
+                v4l2::V4L2_BUF_TYPE_VIDEO_CAPTURE,
+            );
+            self.running = false;
         }
-        buffer.truncate(YUV_FRAME_SIZE);
-
-        Ok(CameraFrame {
-            pixels: buffer,
-            width: YUV_FRAME_WIDTH as u16,
-            height: YUV_FRAME_HEIGHT as u16,
-        })
+        // mmap 由 MmapBuf Drop 负责
+        for buf in self.buffers.drain(..) {
+            let _ = v4l2::munmap_buffer(buf.ptr, buf.len);
+        }
     }
 }
 
-fn ioctl_no_arg(fd: i32, request: u64) -> io::Result<()> {
-    let ret = unsafe { linux::ioctl(fd, request as _, 0usize) };
-    if ret < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
+// ── 辅助函数 ─────────────────────────────────────────────────────────────────
+
+fn try_set_format(
+    fd: i32,
+    pixelformat: u32,
+    width: u32,
+    height: u32,
+) -> io::Result<v4l2::v4l2_pix_format> {
+    let mut fmt = v4l2::v4l2_format::default();
+    fmt.type_ = v4l2::V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.width = width;
+    fmt.fmt.pix.height = height;
+    fmt.fmt.pix.pixelformat = pixelformat;
+    fmt.fmt.pix.field = v4l2::V4L2_FIELD_ANY;
+    fmt.fmt.pix.colorspace = v4l2::V4L2_COLORSPACE_SRGB;
+
+    v4l2::ioctl_ptr(fd, v4l2::VIDIOC_S_FMT, &mut fmt)?;
+    Ok(unsafe { fmt.fmt.pix })
+}
+
+fn fmt_name(pixelformat: u32) -> &'static str {
+    match pixelformat {
+        v4l2::V4L2_PIX_FMT_MJPEG => "MJPEG",
+        v4l2::V4L2_PIX_FMT_YUYV => "YUYV",
+        _ => "unknown",
     }
 }
 
-fn ioctl_ptr<T>(fd: i32, request: u64, ptr: *mut T) -> io::Result<()> {
-    let ret = unsafe { linux::ioctl(fd, request as _, ptr) };
-    if ret < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
+// ── 旧接口的 JPEG 辅助（保留以兼容旧的 image_bridge 测试） ──────────────────
 
 pub fn is_valid_jpeg(data: &[u8]) -> bool {
-    data.len() >= 4 && data.starts_with(&JPEG_MARKER_START) && data.ends_with(&JPEG_MARKER_END)
+    data.len() >= 4
+        && data.starts_with(&[0xFF, 0xD8])
+        && data.ends_with(&[0xFF, 0xD9])
 }
 
 #[cfg(test)]
@@ -163,3 +307,5 @@ mod tests {
         assert!(!is_valid_jpeg(&[0xFF, 0xD8, 1]));
     }
 }
+
+
