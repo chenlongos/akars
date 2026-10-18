@@ -1,4 +1,5 @@
 pub mod arm;
+pub mod bucket;
 pub mod camera;
 pub mod detector;
 pub mod image_bridge;

@@ -46,6 +46,16 @@ impl RawCameraInfo {
     }
 }
 
+/// 帧的平面格式。本分支的取帧路径固定返回 YUV422 planar,即 `I422`;
+/// `I420` 仅用于让 `bucket` 的策略代码能表达两种布局。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanarFormat {
+    /// YUV420 planar: 640×480×1.5 = 460800 字节。
+    I420,
+    /// YUV422 planar: 640×480×2 = 614400 字节。
+    I422,
+}
+
 #[derive(Debug)]
 pub struct CameraFrame {
     /// Raw YUV422 planar (I422) pixels: Y plane, then U plane, then V plane.

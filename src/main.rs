@@ -40,6 +40,8 @@ struct CaptureCli {
     camera: String,
     output: PathBuf,
     warmup: u32,
+    /// `--bucket`:额外跑一遍桶色检测,用来对着真桶标定颜色/距离,不用开整车。
+    bucket: bool,
 }
 
 /// Arguments for manual arm debugging: set all three servo angles directly.
@@ -95,6 +97,7 @@ impl Default for CaptureCli {
             camera: "/dev/cvi-usb-camera0".to_string(),
             output: PathBuf::from("capture.jpg"),
             warmup: 30,
+            bucket: false,
         }
     }
 }
@@ -209,13 +212,18 @@ fn run_hunt(cli: Cli) {
     };
     eprintln!("[dbg] arm opened, entering tennis hunter ...");
 
+    // 抓取/放桶序列跨好几秒,帧数上限会在流程中途把它截断,所以这里不再生效。
+    // --frames 仍然接受,让已有的调用方(rootfs test_runner.sh、benchmark)不改也能跑。
+    if cli.frames.is_some() {
+        eprintln!("[dbg] --frames is ignored; the hunter runs until stopped");
+    }
+
     let config = RobotConfig {
         inference: InferenceConfig {
             classes_num: cli.classes,
             confidence_threshold: cli.conf,
             iou_threshold: cli.iou,
         },
-        max_frames: cli.frames,
     };
 
     run_tennis_hunter(camera, model, motor, arm, config);
@@ -304,6 +312,45 @@ fn run_capture(cli: CaptureCli) {
             std::process::exit(1);
         }
     };
+
+    // ── 桶色检测(--bucket):对着真桶标定颜色/距离,不用开整车 ──
+    if cli.bucket {
+        let (w, h) = (frame.width as i32, frame.height as i32);
+        // 本分支取帧路径固定返回 YUV422 planar。
+        let planar = akars::camera::PlanarFormat::I422;
+        match akars::bucket::detect_bucket(
+            &frame.pixels,
+            w,
+            h,
+            planar,
+            akars::bucket::BUCKET_MIN_AREA_FULLRES,
+        ) {
+            Some(r) => eprintln!(
+                "[bucket] found area={:.3} ({:.0}% of frame) box=({},{},{},{}) center=({},{})",
+                r.area_ratio,
+                r.area_ratio * 100.0,
+                r.x,
+                r.y,
+                r.w,
+                r.h,
+                r.cx,
+                r.cy
+            ),
+            None => eprintln!(
+                "[bucket] not found (min_area={} full-res px)",
+                akars::bucket::BUCKET_MIN_AREA_FULLRES
+            ),
+        }
+        // 判不出来时最有用的一条:桶的实际色相落在哪。
+        match akars::bucket::bucket_color_stats(&frame.pixels, w, h, planar) {
+            Some((hue, sat, val, n)) => eprintln!(
+                "[bucket] coloured pixels: mean H={hue} S={sat} V={val} (n={n}, 判据 H∈[{},{}] 且 S≥80 V≥50)",
+                akars::bucket::BUCKET_HUE_MIN,
+                akars::bucket::BUCKET_HUE_MAX
+            ),
+            None => eprintln!("[bucket] no coloured pixels in view (S/V 下限全灭)"),
+        }
+    }
 
     if let Err(err) = akars::image_bridge::save_yuv422p(
         &frame.pixels,
@@ -535,6 +582,7 @@ fn parse_capture_cli(args: impl Iterator<Item = String>) -> Result<CaptureCli, S
                     .parse()
                     .map_err(|_| "--warmup expects a non-negative integer".to_string())?;
             }
+            "--bucket" => cli.bucket = true,
             value if value.starts_with('-') => {
                 return Err(format!("unknown capture option: {value}"))
             }
@@ -566,7 +614,7 @@ fn print_usage() {
 
 fn print_capture_usage() {
     eprintln!(
-        "Usage: akars capture [output.jpg] [--camera DEV] [--out PATH] [--warmup N]\n\nGrabs a single JPEG frame from the camera, discarding the first N frames so the\nsensor's auto exposure / white balance can settle (warm up).\n\nDefaults:\n  --camera /dev/cvi-usb-camera0\n  --out capture.jpg\n  --warmup 30"
+        "Usage: akars capture [output.jpg] [--camera DEV] [--out PATH] [--warmup N] [--bucket]\n\nGrabs a single JPEG frame from the camera, discarding the first N frames so the\nsensor's auto exposure / white balance can settle (warm up).\n\nWith --bucket it also runs the bucket-colour detector on that frame and reports the\nblob it would chase, the area ratio (放球阈值 0.90 / 制动阈值 0.70), and the mean\nH/S/V of the coloured pixels — so the colour thresholds can be calibrated against\nthe real bucket without driving the car.\n\nDefaults:\n  --camera /dev/cvi-usb-camera0\n  --out capture.jpg\n  --warmup 30"
     );
 }
 

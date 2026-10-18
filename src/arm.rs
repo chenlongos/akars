@@ -3,28 +3,44 @@ use std::io;
 use std::thread;
 use std::time::Duration;
 
+// 舵机角度实测标定。整条抓取序列就四组姿势,对照着改:
+//
+//   姿势              舵机0   舵机1   舵机2(爪)
+//   待抓/归位          READY   READY   OPEN       grab_pos()
+//   伸到最低           GRAB    GRAB    OPEN       grab() 第 1 步
+//   夹住(仍在最低位)   GRAB    GRAB    CLOSE      grab() 第 2 步
+//   抬起/持球找桶      LIFT    LIFT    CLOSE      grab() 第 3 步,一直保持到桶口才 release()
+//
+// 注意"抬"几乎全是舵机1 干的(READY 185 → LIFT),舵机0 只是从 GRAB 回到 LIFT 位。
 const ID2_ANGLE_OPEN: f32 = 140.0;
 const ID2_ANGLE_CLOSE: f32 = 90.0;
 const ANGLE_MAX: f32 = 270.0;
 const PULSE_MIN: i32 = 500;
 const PULSE_MAX: i32 = 2500;
 
-const SERVO0_READY: f32 = 180.0;
+const SERVO0_READY: f32 = 150.0;
 const SERVO1_READY: f32 = 185.0;
 const SERVO0_GRAB: f32 = 245.0;
 const SERVO1_GRAB: f32 = 185.0;
-const SERVO0_LIFT: f32 = 180.0;
-const SERVO1_LIFT: f32 = 100.0;
+// LIFT 当前与 READY 同值 —— 是有意的,不是复制粘贴漏改:持球姿势就是归位姿势。
+const SERVO0_LIFT: f32 = 150.0;
+const SERVO1_LIFT: f32 = 185.0;
 
 pub struct Arm {
-    port: SerialPort,
+    port: Option<SerialPort>,
 }
 
 impl Arm {
+    /// 无硬件桩:port=None,所有指令静默丢弃。仅供测试使用。
+    #[cfg(test)]
+    pub fn mock() -> Self {
+        Self { port: None }
+    }
+
     pub fn open(device: &str, baudrate: i32) -> io::Result<Self> {
         crate::pinmux::configure_for_device(device);
         Ok(Self {
-            port: SerialPort::open(device, baudrate, false)?,
+            port: Some(SerialPort::open(device, baudrate, false)?),
         })
     }
 
@@ -79,7 +95,10 @@ impl Arm {
     }
 
     fn send_command(&mut self, command: &str) {
-        if let Err(err) = self.port.write_all_drain(command.as_bytes()) {
+        let Some(port) = &mut self.port else {
+            return; // mock/test:无硬件,静默丢弃舵机指令
+        };
+        if let Err(err) = port.write_all_drain(command.as_bytes()) {
             eprintln!("[arm] write failed: {err}");
         }
     }

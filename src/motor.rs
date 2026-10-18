@@ -65,6 +65,17 @@ impl Motor {
         Ok(motor)
     }
 
+    /// 无硬件桩:port=None 时所有 send_frame 自然变 no-op(已有 Option 设计)。
+    /// 仅供测试使用。
+    #[cfg(test)]
+    pub fn mock() -> Self {
+        Self {
+            port: None,
+            speed_scale: 1,
+            min_speed: 0,
+        }
+    }
+
     pub fn forward(&mut self, speed: i32) {
         self.drive(speed, speed);
     }
