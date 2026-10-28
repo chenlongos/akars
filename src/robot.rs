@@ -365,9 +365,14 @@ pub fn run_tennis_hunter(
                 model_w,
                 model_h,
             ),
-            ModelInputFormat::Yuv420Planar => {
-                image_bridge::yuv422p_to_yuv420p(&frame.pixels, &mut input_buffer, model_w, model_h)
-            }
+            ModelInputFormat::Yuv420Planar => image_bridge::yuv422p_to_yuv420p_scaled(
+                &frame.pixels,
+                &mut input_buffer,
+                frame.width as i32,
+                frame.height as i32,
+                model_w,
+                model_h,
+            ),
             ModelInputFormat::YuvNv12 => {
                 image_bridge::yuv422p_to_nv12(&frame.pixels, &mut input_buffer, model_w, model_h)
             }

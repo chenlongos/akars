@@ -9,10 +9,13 @@ const CVI_CAMERA_IOCTL_INIT: u64 = 1;
 const CVI_CAMERA_IOCTL_GET_INFO: u64 = 2;
 // cmd 4: kernel returns a raw YUV422 planar (I422) frame instead of MJPEG.
 const CVI_CAMERA_IOCTL_GET_FRAME: u64 = 4;
-const YUV_FRAME_WIDTH: usize = 640;
-const YUV_FRAME_HEIGHT: usize = 480;
-// I422: full-size Y plane + U and V planes each subsampled horizontally (w/2 × h).
-const YUV_FRAME_SIZE: usize = YUV_FRAME_WIDTH * YUV_FRAME_HEIGHT * 2;
+// I422 (YUV422 planar) frame layout: full-size Y plane + U and V planes each
+// subsampled horizontally (w/2 × h), i.e. `width * height * 2` bytes.
+// The concrete size is derived in `get_frame` from the resolution the kernel
+// actually negotiated (reported by GET_INFO) instead of a hardcoded 640×480, so
+// cameras without a 640×480 mode (e.g. b349:b182 → 640×360) also work while a
+// 640×480 camera is unaffected.
+const YUV_BYTES_PER_PIXEL: usize = 2;
 const JPEG_MARKER_START: [u8; 2] = [0xFF, 0xD8];
 const JPEG_MARKER_END: [u8; 2] = [0xFF, 0xD9];
 
@@ -107,7 +110,21 @@ impl UsbCamera {
     }
 
     pub fn get_frame(&mut self) -> io::Result<CameraFrame> {
-        let mut buffer = vec![0u8; YUV_FRAME_SIZE];
+        // Size the buffer from the negotiated resolution reported at open time.
+        // The kernel decodes MJPEG to I422 (`width * height * 2` bytes) at that
+        // resolution, so a 640×480 camera keeps the old 614400-byte path while a
+        // 640×360 camera (no 640×480 mode) gets a correctly-sized 460800-byte frame.
+        let width = self.info.width as usize;
+        let height = self.info.height as usize;
+        let expected = width * height * YUV_BYTES_PER_PIXEL;
+        if expected == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "camera reported a zero-sized frame",
+            ));
+        }
+
+        let mut buffer = vec![0u8; expected];
         let ret = unsafe {
             linux::ioctl(
                 self.file.as_raw_fd(),
@@ -121,21 +138,21 @@ impl UsbCamera {
 
         // eprintln!("[camera] ioctl returned {ret} bytes");
         // The kernel may signal success with 0 or report the byte count; either
-        // way we expect one full I420 frame in the buffer.
+        // way we expect one full I422 frame in the buffer.
         let size = ret as usize;
 
-        if size != 0 && size < YUV_FRAME_SIZE {
+        if size != 0 && size < expected {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "camera returned a short YUV frame",
             ));
         }
-        buffer.truncate(YUV_FRAME_SIZE);
+        buffer.truncate(expected);
 
         Ok(CameraFrame {
             pixels: buffer,
-            width: YUV_FRAME_WIDTH as u16,
-            height: YUV_FRAME_HEIGHT as u16,
+            width: self.info.width,
+            height: self.info.height,
         })
     }
 }

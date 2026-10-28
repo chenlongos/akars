@@ -224,6 +224,177 @@ pub fn yuv422p_to_yuv420p(
     Ok(())
 }
 
+/// Convert an I422 frame captured at (`src_w`, `src_h`) into an I420 tensor at
+/// (`dst_w`, `dst_h`) using aspect-preserving letterbox: a single uniform scale
+/// followed by a centered pad. The scale/pad geometry deliberately mirrors
+/// `correct_yolo_boxes`, which assumes the tensor was filled the same way, so
+/// detections map back to camera coordinates without an offset error even when
+/// the capture size differs from the model input.
+///
+/// Luma padding is filled with 0 and chroma padding with 128 (full-range BT.601
+/// black, the YUV equivalent of the RGB-black pad the MJPEG letterbox path uses).
+/// This keeps a round object round instead of anamorphically stretching it, which
+/// a non-uniform resize would distort and would also desynchronize from the box
+/// remapping.
+///
+/// When the source already matches the destination this defers to the plain
+/// [`yuv422p_to_yuv420p`] repack, so a camera negotiated at exactly the model
+/// input size (e.g. 640x480, camera A) keeps byte-for-byte identical behavior and
+/// cost.
+pub fn yuv422p_to_yuv420p_scaled(
+    yuv422: &[u8],
+    dst: &mut [u8],
+    src_w: i32,
+    src_h: i32,
+    dst_w: i32,
+    dst_h: i32,
+) -> Result<(), ImageBridgeError> {
+    let (sw, sh) = valid_dimensions(src_w, src_h)?;
+    let (dw, dh) = valid_dimensions(dst_w, dst_h)?;
+    let (sw, sh, dw, dh) = (sw as usize, sh as usize, dw as usize, dh as usize);
+    if (sw & 1) != 0 || (sh & 1) != 0 || (dw & 1) != 0 || (dh & 1) != 0 {
+        return Err(ImageBridgeError::InvalidInput(
+            "I420 conversion requires even image dimensions",
+        ));
+    }
+
+    if sw == dw && sh == dh {
+        return yuv422p_to_yuv420p(yuv422, dst, src_w, src_h);
+    }
+
+    let src_y = sw * sh;
+    let src_chroma_w = sw / 2;
+    // I422 chroma keeps full height, one sample pair per two luma columns.
+    let src_chroma_size = src_chroma_w * sh;
+    if yuv422.len() < src_y + 2 * src_chroma_size {
+        return Err(ImageBridgeError::InvalidInput(
+            "YUV input smaller than one I422 frame",
+        ));
+    }
+
+    let dst_y = dw * dh;
+    let dst_chroma_w = dw / 2;
+    let dst_chroma_h = dh / 2;
+    let dst_chroma_size = dst_chroma_w * dst_chroma_h;
+    if dst.len() < dst_y + 2 * dst_chroma_size {
+        return Err(ImageBridgeError::InvalidInput(
+            "destination tensor buffer is too small",
+        ));
+    }
+
+    // Letterbox geometry: the same uniform-scale + center-pad math that
+    // correct_yolo_boxes reconstructs, so boxes stay aligned. Even resized dims
+    // keep the I420 chroma grid aligned with the luma window.
+    let scale = (dw as f64 / sw as f64).min(dh as f64 / sh as f64);
+    let mut resized_w = ((sw as f64 * scale) as usize).max(2);
+    let mut resized_h = ((sh as f64 * scale) as usize).max(2);
+    resized_w -= resized_w % 2;
+    resized_h -= resized_h % 2;
+    let pad_left = (dw - resized_w) / 2;
+    let pad_top = (dh - resized_h) / 2;
+
+    let (s_y, s_rest) = yuv422.split_at(src_y);
+    let (s_u, s_v) = s_rest.split_at(src_chroma_size);
+    let (d_y, d_rest) = dst.split_at_mut(dst_y);
+    let (d_u, d_v) = d_rest.split_at_mut(dst_chroma_size);
+
+    d_y.fill(0);
+    d_u.fill(128);
+    d_v.fill(128);
+
+    scale_plane(
+        s_y,
+        sw,
+        sh,
+        &mut PlaneWindow {
+            buf: d_y,
+            stride: dw,
+            w: resized_w,
+            h: resized_h,
+            x: pad_left,
+            y: pad_top,
+        },
+    );
+
+    // Collapse I422 chroma (full height) to an I420 chroma grid at source scale
+    // by averaging vertical pairs, then letterbox-resample it into the
+    // destination chroma planes at half the luma offsets.
+    let src_chroma_i420_size = src_chroma_w * (sh / 2);
+    let mut tmp_u = vec![0u8; src_chroma_i420_size];
+    let mut tmp_v = vec![0u8; src_chroma_i420_size];
+    downsample_i422_chroma_to_i420(s_u, &mut tmp_u, src_chroma_w, sh);
+    downsample_i422_chroma_to_i420(s_v, &mut tmp_v, src_chroma_w, sh);
+    scale_plane(
+        &tmp_u,
+        src_chroma_w,
+        sh / 2,
+        &mut PlaneWindow {
+            buf: d_u,
+            stride: dst_chroma_w,
+            w: resized_w / 2,
+            h: resized_h / 2,
+            x: pad_left / 2,
+            y: pad_top / 2,
+        },
+    );
+    scale_plane(
+        &tmp_v,
+        src_chroma_w,
+        sh / 2,
+        &mut PlaneWindow {
+            buf: d_v,
+            stride: dst_chroma_w,
+            w: resized_w / 2,
+            h: resized_h / 2,
+            x: pad_left / 2,
+            y: pad_top / 2,
+        },
+    );
+
+    Ok(())
+}
+
+/// Destination sub-region of an 8-bit plane: a `w x h` window placed at
+/// (`x`, `y`) inside a `stride`-wide buffer.
+struct PlaneWindow<'a> {
+    buf: &'a mut [u8],
+    stride: usize,
+    w: usize,
+    h: usize,
+    x: usize,
+    y: usize,
+}
+
+/// Bilinearly resample a single 8-bit plane (row-major, source stride == width)
+/// into the destination window. Pixels outside the window keep whatever the
+/// caller prefilled (the letterbox pad). When the window equals the source size
+/// the interpolation tables degenerate to an exact copy.
+fn scale_plane(src: &[u8], src_w: usize, src_h: usize, win: &mut PlaneWindow<'_>) {
+    if src_w == 0 || src_h == 0 || win.w == 0 || win.h == 0 {
+        return;
+    }
+    // Fixed-point weights (0..=256) match `interpolate_channel` so scaled and
+    // unscaled frames stay visually consistent.
+    let mut x_cache = InterpolationCache::default();
+    let mut y_cache = InterpolationCache::default();
+    let x_table = x_cache.ensure(src_w as u32, win.w as u32);
+    let y_table = y_cache.ensure(src_h as u32, win.h as u32);
+    for (dy, y) in y_table.iter().enumerate() {
+        let row0 = y.start as usize * src_w;
+        let row1 = y.end as usize * src_w;
+        let base = (win.y + dy) * win.stride + win.x;
+        for (dx, x) in x_table.iter().enumerate() {
+            let iw_x = 256 - x.weight;
+            let iw_y = 256 - y.weight;
+            let value = src[row0 + x.start as usize] as u32 * iw_x * iw_y
+                + src[row0 + x.end as usize] as u32 * x.weight * iw_y
+                + src[row1 + x.start as usize] as u32 * iw_x * y.weight
+                + src[row1 + x.end as usize] as u32 * x.weight * y.weight;
+            win.buf[base + dx] = ((value + 32_768) >> 16) as u8;
+        }
+    }
+}
+
 /// Convert I422 into NV12: full-size Y plane followed by interleaved U/V pairs
 /// at 2x2 chroma subsampling.
 pub fn yuv422p_to_nv12(
@@ -821,8 +992,8 @@ const FONT_HEIGHT: i32 = 7;
 #[cfg(test)]
 mod tests {
     use super::{
-        draw_detection, pack_rgb_planar_copy, text_size, yuv422p_to_nv12, yuv422p_to_nv21,
-        yuv422p_to_yuv420p, ImagePreprocessor,
+        ImagePreprocessor, draw_detection, pack_rgb_planar_copy, text_size, yuv422p_to_nv12,
+        yuv422p_to_nv21, yuv422p_to_yuv420p, yuv422p_to_yuv420p_scaled,
     };
     use crate::detector::{Box2d, Detection};
     use image::codecs::jpeg::JpegEncoder;
@@ -872,9 +1043,11 @@ mod tests {
         let jpeg = encode_test_jpeg(1, 1, |_, _| Rgb([255, 0, 0]));
         let mut dst = vec![0; 2];
         let mut preprocessor = ImagePreprocessor::new();
-        assert!(preprocessor
-            .mjpeg_to_rgb_planar(&jpeg, &mut dst, 1, 1)
-            .is_err());
+        assert!(
+            preprocessor
+                .mjpeg_to_rgb_planar(&jpeg, &mut dst, 1, 1)
+                .is_err()
+        );
     }
 
     #[test]
@@ -920,6 +1093,67 @@ mod tests {
         let mut nv21 = vec![0; 12];
         yuv422p_to_nv21(&src, &mut nv21, 4, 2).unwrap();
         assert_eq!(&nv21, &[1, 2, 3, 4, 5, 6, 7, 8, 60, 20, 70, 30]);
+    }
+
+    #[test]
+    fn scaled_identity_matches_plain_repack() {
+        // A camera captured exactly at the model input size must be byte-for-byte
+        // identical to the plain repack, so the 640x480 path stays unchanged.
+        let y = [1, 2, 3, 4, 5, 6, 7, 8];
+        let u = [10, 20, 30, 40];
+        let v = [50, 60, 70, 80];
+        let mut src = Vec::new();
+        src.extend_from_slice(&y);
+        src.extend_from_slice(&u);
+        src.extend_from_slice(&v);
+
+        let mut plain = vec![0; 12];
+        yuv422p_to_yuv420p(&src, &mut plain, 4, 2).unwrap();
+
+        let mut scaled = vec![0; 12];
+        yuv422p_to_yuv420p_scaled(&src, &mut scaled, 4, 2, 4, 2).unwrap();
+
+        assert_eq!(scaled, plain);
+    }
+
+    #[test]
+    fn scaling_smaller_capture_letterboxes_into_tensor() {
+        // Reproduces camera B: a 4x2 (16:9-like) I422 capture fed to a 4x4 (4:3)
+        // I420 tensor. The result must be an aspect-preserving letterbox, not a
+        // stretch: uniform scale 1.0 keeps the frame 4x2 and pads one luma row on
+        // top and bottom (Y=0), with chroma padded to neutral 128. This matches the
+        // pad_top=1 the post-processing reconstructs in correct_yolo_boxes.
+        let y = [1, 2, 3, 4, 5, 6, 7, 8];
+        let u = [10, 20, 30, 40];
+        let v = [50, 60, 70, 80];
+        let mut src = Vec::new();
+        src.extend_from_slice(&y);
+        src.extend_from_slice(&u);
+        src.extend_from_slice(&v);
+
+        let mut dst = vec![255; 4 * 4 + 2 * (4 / 2) * (4 / 2)];
+        yuv422p_to_yuv420p_scaled(&src, &mut dst, 4, 2, 4, 4).unwrap();
+
+        // Y plane 4x4: blank top/bottom rows, untouched frame in the middle two.
+        // U/V chroma planes 2x2: averaged row kept, padded row set to 128.
+        let expected = [
+            0, 0, 0, 0, // luma pad row
+            1, 2, 3, 4, // scaled source row 0 (scale 1.0 => copy)
+            5, 6, 7, 8, // scaled source row 1
+            0, 0, 0, 0, // luma pad row
+            20, 30, 128, 128, // U: avg(10,30), avg(20,40), pad
+            60, 70, 128, 128, // V: avg(50,70), avg(60,80), pad
+        ];
+        assert_eq!(&dst[..], &expected[..]);
+    }
+
+    #[test]
+    fn plain_repack_rejects_undersized_capture_for_model_dims() {
+        // Documents the original failure: interpreting a 4x2 buffer as a 4x4 I422
+        // frame needs 32 bytes but only 16 exist, so the non-scaling repack errors.
+        let src = vec![0u8; 4 * 2 + 2 * (4 / 2) * 2];
+        let mut dst = vec![0; 4 * 4 + 2 * (4 / 2) * (4 / 2)];
+        assert!(yuv422p_to_yuv420p(&src, &mut dst, 4, 4).is_err());
     }
 
     fn encode_test_jpeg(width: u32, height: u32, pixel: impl Fn(u32, u32) -> Rgb<u8>) -> Vec<u8> {
