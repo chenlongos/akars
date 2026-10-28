@@ -85,7 +85,7 @@ mod imp {
     use super::{CameraFrame, Detection, InferTiming, InferenceConfig, ModelInputFormat, TpuError};
     use crate::detector::{correct_yolo_boxes, nms, parse_yolov8_output};
     use crate::image_bridge;
-    use std::ffi::{c_char, c_int, c_void, CString};
+    use std::ffi::{CString, c_char, c_int, c_void};
     use std::os::unix::ffi::OsStrExt;
     use std::path::Path;
     use std::ptr;

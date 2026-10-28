@@ -138,7 +138,7 @@ pub fn parse_yolov8_output(
 
 #[cfg(test)]
 mod tests {
-    use super::{cal_iou, correct_yolo_boxes, nms, parse_yolov8_output, Box2d, Detection};
+    use super::{Box2d, Detection, cal_iou, correct_yolo_boxes, nms, parse_yolov8_output};
 
     #[test]
     fn iou_identical_boxes_is_one() {

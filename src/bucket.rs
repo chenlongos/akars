@@ -175,7 +175,12 @@ pub fn detect_bucket(
     }
 
     let mask = build_color_mask(frame, width, &layout);
-    let boxes = find_boxes(&mask, layout.cw, layout.ch, layout.min_area_chroma(min_area_fullres));
+    let boxes = find_boxes(
+        &mask,
+        layout.cw,
+        layout.ch,
+        layout.min_area_chroma(min_area_fullres),
+    );
     let best = boxes.iter().max_by_key(|b| b.area)?;
 
     // 色度网格坐标 → 全分辨率坐标（横向恒定 ×2；纵向 I420 是 ×2、I422 是 ×1）。
@@ -238,13 +243,24 @@ pub fn bucket_color_stats(
     if n == 0 {
         return None;
     }
-    Some(((hs / n as i64) as i32, (ss / n as i64) as i32, (vs / n as i64) as i32, n))
+    Some((
+        (hs / n as i64) as i32,
+        (ss / n as i64) as i32,
+        (vs / n as i64) as i32,
+        n,
+    ))
 }
 
 /// 取一个色度采样点，重建出它的 (H, S, V)。
 /// 亮度取该采样点覆盖的亮度块均值（I420: 2×2，I422: 2×1）—— 检测器和标定都走这里，
 /// 保证"哪里算目标色"和"看到的色相是多少"用的是同一套几何。
-fn sample_hsv(frame: &[u8], width: usize, layout: &ChromaLayout, cx: usize, cy: usize) -> (i32, i32, i32) {
+fn sample_hsv(
+    frame: &[u8],
+    width: usize,
+    layout: &ChromaLayout,
+    cx: usize,
+    cy: usize,
+) -> (i32, i32, i32) {
     let idx = cy * layout.cw as usize + cx;
     let u = frame[layout.u_off + idx];
     let v = frame[layout.v_off + idx];
@@ -397,7 +413,10 @@ fn find_boxes(mask: &[u8], cw: i32, ch: i32, min_area: i32) -> Vec<BucketBox> {
                 (0, l) => label[idx] = l,
                 (u, l) => {
                     label[idx] = l;
-                    let (ra, rb) = (uf_find(&mut parent, u as usize), uf_find(&mut parent, l as usize));
+                    let (ra, rb) = (
+                        uf_find(&mut parent, u as usize),
+                        uf_find(&mut parent, l as usize),
+                    );
                     if ra != rb {
                         parent[ra] = rb as i32;
                     }
@@ -639,7 +658,10 @@ impl BucketTrack {
                             self.phase = BucketPhase::Approaching;
                             self.confirm = 0;
                             if bucket_log() {
-                                eprintln!("[bucket] confirmed, area={:.3} -> approach", r.area_ratio);
+                                eprintln!(
+                                    "[bucket] confirmed, area={:.3} -> approach",
+                                    r.area_ratio
+                                );
                             }
                         } else if bucket_log() {
                             eprintln!(
@@ -674,7 +696,10 @@ impl BucketTrack {
                             motor.standby();
                         }
                         if bucket_log() {
-                            eprintln!("[bucket] approach: lost {}/{}", self.lost, BUCKET_LOST_FRAMES);
+                            eprintln!(
+                                "[bucket] approach: lost {}/{}",
+                                self.lost, BUCKET_LOST_FRAMES
+                            );
                         }
                     }
                     Some(r) => {
@@ -685,7 +710,10 @@ impl BucketTrack {
                             };
                             motor.brake();
                             if bucket_log() {
-                                eprintln!("[bucket] area={:.3} -> brake {}ms", r.area_ratio, BUCKET_BRAKE_MS);
+                                eprintln!(
+                                    "[bucket] area={:.3} -> brake {}ms",
+                                    r.area_ratio, BUCKET_BRAKE_MS
+                                );
                             }
                         } else {
                             let (l, rr) = bucket_approach_command(r.area_ratio, r.cx, width / 2);
@@ -821,13 +849,13 @@ mod tests {
     fn hue_window_covers_realistic_blue_objects() {
         // 几种真实蓝物体在该 RGB 下的色相(见 rgb2hsv 的算法)。
         let realistic_blues = [
-            ((0u8, 0u8, 255u8), 240),   // 理想纯蓝
-            ((0, 90, 170), 208),        // 常见深蓝塑料桶
-            ((0, 60, 120), 210),        // 更暗的蓝
-            ((30, 80, 200), 222),       // 标准中蓝
-            ((100, 160, 220), 210),     // 浅蓝/天蓝
-            ((80, 60, 200), 248),       // 偏紫的蓝
-            ((20, 35, 90), 227),        // 藏青
+            ((0u8, 0u8, 255u8), 240), // 理想纯蓝
+            ((0, 90, 170), 208),      // 常见深蓝塑料桶
+            ((0, 60, 120), 210),      // 更暗的蓝
+            ((30, 80, 200), 222),     // 标准中蓝
+            ((100, 160, 220), 210),   // 浅蓝/天蓝
+            ((80, 60, 200), 248),     // 偏紫的蓝
+            ((20, 35, 90), 227),      // 藏青
         ];
         for ((r, g, b), expect) in realistic_blues {
             let (h, s, v) = rgb2hsv(r, g, b);
@@ -839,10 +867,15 @@ mod tests {
     #[test]
     fn converts_yuv_back_to_rgb() {
         let (r, g, b) = yuv_to_rgb(76, 85, 255);
-        assert!(r > 240 && g < 20 && b < 20, "纯红应还原成红,实得 {r},{g},{b}");
+        assert!(
+            r > 240 && g < 20 && b < 20,
+            "纯红应还原成红,实得 {r},{g},{b}"
+        );
         let (r, g, b) = yuv_to_rgb(128, 128, 128);
         assert!(
-            (r as i32 - 128).abs() <= 2 && (g as i32 - 128).abs() <= 2 && (b as i32 - 128).abs() <= 2,
+            (r as i32 - 128).abs() <= 2
+                && (g as i32 - 128).abs() <= 2
+                && (b as i32 - 128).abs() <= 2,
             "灰应还原成灰,实得 {r},{g},{b}"
         );
     }
@@ -856,7 +889,11 @@ mod tests {
             .expect("应找到蓝块");
         // 面积比与全分辨率口径一致:200*160 / (640*480)
         let expect = (200.0 * 160.0) / (640.0 * 480.0);
-        assert!((r.area_ratio - expect).abs() < 1e-4, "实得 {}", r.area_ratio);
+        assert!(
+            (r.area_ratio - expect).abs() < 1e-4,
+            "实得 {}",
+            r.area_ratio
+        );
         // 坐标必须换算回全分辨率,否则死区 15px / 半宽 320 这些常数全错。
         assert_eq!((r.x, r.w), (200, 200));
         assert_eq!((r.y, r.h), (150, 160));
@@ -893,15 +930,43 @@ mod tests {
     fn connectivity_is_four_connected() {
         // 对角相接 → 两块;边相接 → 一块。色度采样点是 2×2 全分辨率像素,
         // 所以色度上相邻 = 全分辨率上隔 2 像素。
-        let diag = synthetic(640, 480, PlanarFormat::I420, &[(20, 20, 2, 2), (22, 22, 2, 2)]);
+        let diag = synthetic(
+            640,
+            480,
+            PlanarFormat::I420,
+            &[(20, 20, 2, 2), (22, 22, 2, 2)],
+        );
         let r = detect_bucket(&diag, W, H, PlanarFormat::I420, 1).unwrap();
         assert_eq!(r.area_ratio, 1.0 / (320.0 * 240.0), "只应命中一个采样点");
         // 直接打 find_boxes 看连通域个数更直接。
         let layout = ChromaLayout::for_format(PlanarFormat::I420, W, H);
-        assert_eq!(find_boxes(&build_color_mask(&diag, W, &layout), layout.cw, layout.ch, 1).len(), 2);
+        assert_eq!(
+            find_boxes(
+                &build_color_mask(&diag, W, &layout),
+                layout.cw,
+                layout.ch,
+                1
+            )
+            .len(),
+            2
+        );
 
-        let edge = synthetic(640, 480, PlanarFormat::I420, &[(20, 20, 2, 2), (22, 20, 2, 2)]);
-        assert_eq!(find_boxes(&build_color_mask(&edge, W, &layout), layout.cw, layout.ch, 1).len(), 1);
+        let edge = synthetic(
+            640,
+            480,
+            PlanarFormat::I420,
+            &[(20, 20, 2, 2), (22, 20, 2, 2)],
+        );
+        assert_eq!(
+            find_boxes(
+                &build_color_mask(&edge, W, &layout),
+                layout.cw,
+                layout.ch,
+                1
+            )
+            .len(),
+            1
+        );
     }
 
     #[test]
@@ -925,7 +990,8 @@ mod tests {
     #[test]
     fn bucket_color_stats_reads_the_hue_off_a_full_blue_frame() {
         let blue = synthetic(640, 480, PlanarFormat::I420, &[(0, 0, 640, 480)]);
-        let (h, s, v, n) = bucket_color_stats(&blue, W, H, PlanarFormat::I420).expect("应有有色像素");
+        let (h, s, v, n) =
+            bucket_color_stats(&blue, W, H, PlanarFormat::I420).expect("应有有色像素");
         // 纯蓝经 YUV 往返后落在 239~240(定点往返有 ±1 的色相抖动),窗口正中。
         assert!((238..=241).contains(&h), "纯蓝 H≈240,实得 {h}");
         assert!(s >= 250 && v >= 250, "纯蓝应又饱和又亮,实得 S={s} V={v}");
@@ -957,7 +1023,8 @@ mod tests {
             detect_bucket(&frame, W, H, PlanarFormat::I420, 1).is_none(),
             "H≈25 落在蓝窗之外,检测器应该看不见"
         );
-        let (h, s, v, n) = bucket_color_stats(&frame, W, H, PlanarFormat::I420).expect("标定应看得见");
+        let (h, s, v, n) =
+            bucket_color_stats(&frame, W, H, PlanarFormat::I420).expect("标定应看得见");
         assert!((20..30).contains(&h), "应报出真实色相约 25,实得 H={h}");
         assert!(s >= 80 && v >= 50);
         assert_eq!(n, 320 * 240);
@@ -973,7 +1040,8 @@ mod tests {
             }
             seen[start] = true;
             let mut stack = vec![start];
-            let (mut x0, mut y0, mut x1, mut y1, mut area) = (cw as i32, ch as i32, -1i32, -1i32, 0i32);
+            let (mut x0, mut y0, mut x1, mut y1, mut area) =
+                (cw as i32, ch as i32, -1i32, -1i32, 0i32);
             while let Some(i) = stack.pop() {
                 let (x, y) = ((i % cw) as i32, (i / cw) as i32);
                 area += 1;
@@ -1047,7 +1115,11 @@ mod tests {
     fn approach_creeps_once_in_the_brake_zone() {
         let half = W / 2;
         assert_eq!(bucket_approach_command(0.69, half, half), (25, 25));
-        assert_eq!(bucket_approach_command(0.70, half, half), (22, 22), "进入制动区降到蠕行档");
+        assert_eq!(
+            bucket_approach_command(0.70, half, half),
+            (22, 22),
+            "进入制动区降到蠕行档"
+        );
         assert_eq!(bucket_approach_command(0.90, half, half), (22, 22));
         // 制动区 + 大偏差:仍是一个向前的小弧,不是原地转。
         // (参考的 spd=5 在这里会让内轮反转成 13/-3 —— 而两轮都低于能动下限,
@@ -1055,11 +1127,17 @@ mod tests {
         // bias 在 off=160 就顶到 ±8 了(20×160/320 = 10 → 夹到 8)。
         assert_eq!(bucket_approach_command(0.80, half + 100, half), (28, 16));
         assert_eq!(bucket_approach_command(0.80, half + 160, half), (30, 14));
-        assert_eq!(bucket_approach_command(0.80, half + 160, half), bucket_approach_command(0.80, W, half));
+        assert_eq!(
+            bucket_approach_command(0.80, half + 160, half),
+            bucket_approach_command(0.80, W, half)
+        );
         // 关键不变量:制动力矩全给到偏差那一侧时,外侧轮仍在能动档以上 ——
         // 车会偏着走,但绝不死住。(内侧轮可能低于下限而拖住,那是允许的。)
         let (l, r) = bucket_approach_command(0.80, half + 160, half);
-        assert!(l.max(r) >= MIN_MOVING_SPEED, "两轮都低于能动下限 = 整车死住");
+        assert!(
+            l.max(r) >= MIN_MOVING_SPEED,
+            "两轮都低于能动下限 = 整车死住"
+        );
     }
 
     // ── 状态机 ────────────────────────────────────────────────────────────
@@ -1112,7 +1190,10 @@ mod tests {
     fn idle_until_started() {
         let mut rig = Rig::new();
         assert!(!rig.track.is_active());
-        assert_eq!(rig.step(&bucket_frame(), Instant::now()), BucketOutcome::Finished);
+        assert_eq!(
+            rig.step(&bucket_frame(), Instant::now()),
+            BucketOutcome::Finished
+        );
         rig.track.start();
         assert!(rig.track.is_active());
         assert_eq!(rig.track.phase(), BucketPhase::Find);
@@ -1140,7 +1221,11 @@ mod tests {
         assert_eq!(rig.track.confirm_count(), 0);
         rig.step(&frame, now);
         rig.step(&frame, now);
-        assert_eq!(rig.track.phase(), BucketPhase::Find, "丢过一帧后要重新数满 3 帧");
+        assert_eq!(
+            rig.track.phase(),
+            BucketPhase::Find,
+            "丢过一帧后要重新数满 3 帧"
+        );
     }
 
     #[test]
@@ -1158,7 +1243,11 @@ mod tests {
         for _ in 0..BUCKET_LOST_FRAMES {
             rig.step(&no_bucket_frame(), now);
         }
-        assert_eq!(rig.track.phase(), BucketPhase::Approaching, "10 帧内不该放弃");
+        assert_eq!(
+            rig.track.phase(),
+            BucketPhase::Approaching,
+            "10 帧内不该放弃"
+        );
         // 第 11 帧 → 退回搜索。
         rig.step(&no_bucket_frame(), now);
         assert_eq!(rig.track.phase(), BucketPhase::Find);
