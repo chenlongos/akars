@@ -1,4 +1,5 @@
 use crate::arm::Arm;
+use crate::config::DEFAULT_CONFIG_PATH;
 use crate::motor::{Motor, MotorConfig};
 use axum::extract::{Query, State};
 use axum::response::Html;
@@ -7,6 +8,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug)]
@@ -15,6 +17,8 @@ pub struct WebConfig {
     pub motor_device: String,
     pub arm_device: String,
     pub mock: bool,
+    /// 底盘/机械臂运动参数的 TOML 配置文件路径。
+    pub config_path: PathBuf,
 }
 
 impl Default for WebConfig {
@@ -24,6 +28,7 @@ impl Default for WebConfig {
             motor_device: "/dev/ttyS3".to_string(),
             arm_device: "/dev/ttyS2".to_string(),
             mock: false,
+            config_path: PathBuf::from(DEFAULT_CONFIG_PATH),
         }
     }
 }
@@ -222,9 +227,13 @@ impl HardwareState {
             return;
         }
 
+        let motor_file = crate::config::get().motor;
         let motor_config = MotorConfig {
             device: config.motor_device.clone(),
-            ..MotorConfig::default()
+            speed_scale: motor_file.speed_scale,
+            min_speed: motor_file.min_speed,
+            ppr: motor_file.ppr,
+            pwm_freq: motor_file.pwm_freq,
         };
         match Motor::open(&motor_config) {
             Ok(motor) => self.motor = Some(motor),

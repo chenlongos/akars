@@ -1,3 +1,4 @@
+use crate::config;
 use crate::serial::SerialPort;
 use std::io;
 use std::thread;
@@ -12,19 +13,19 @@ use std::time::Duration;
 //   抬起/持球找桶      LIFT    LIFT    CLOSE      grab() 第 3 步,一直保持到桶口才 release()
 //
 // 注意"抬"几乎全是舵机1 干的(READY 185 → LIFT),舵机0 只是从 GRAB 回到 LIFT 位。
-const ID2_ANGLE_OPEN: f32 = 140.0;
-const ID2_ANGLE_CLOSE: f32 = 90.0;
-const ANGLE_MAX: f32 = 270.0;
-const PULSE_MIN: i32 = 500;
-const PULSE_MAX: i32 = 2500;
+pub(crate) const ID2_ANGLE_OPEN: f32 = 140.0;
+pub(crate) const ID2_ANGLE_CLOSE: f32 = 90.0;
+pub(crate) const ANGLE_MAX: f32 = 270.0;
+pub(crate) const PULSE_MIN: i32 = 500;
+pub(crate) const PULSE_MAX: i32 = 2500;
 
-const SERVO0_READY: f32 = 150.0;
-const SERVO1_READY: f32 = 185.0;
-const SERVO0_GRAB: f32 = 245.0;
-const SERVO1_GRAB: f32 = 185.0;
+pub(crate) const SERVO0_READY: f32 = 150.0;
+pub(crate) const SERVO1_READY: f32 = 185.0;
+pub(crate) const SERVO0_GRAB: f32 = 245.0;
+pub(crate) const SERVO1_GRAB: f32 = 185.0;
 // LIFT 当前与 READY 同值 —— 是有意的,不是复制粘贴漏改:持球姿势就是归位姿势。
-const SERVO0_LIFT: f32 = 150.0;
-const SERVO1_LIFT: f32 = 185.0;
+pub(crate) const SERVO0_LIFT: f32 = 150.0;
+pub(crate) const SERVO1_LIFT: f32 = 185.0;
 
 pub struct Arm {
     port: Option<SerialPort>,
@@ -45,7 +46,7 @@ impl Arm {
     }
 
     pub fn set_angle(&mut self, servo_id: i32, angle: f32, time_ms: i32) {
-        let clamped = angle.clamp(0.0, ANGLE_MAX);
+        let clamped = angle.clamp(0.0, config::get().arm.angle_max);
         let pulse = angle_to_pulse(clamped);
         self.send_command(&format!("#{servo_id:03}P{pulse:04}T{time_ms}!"));
     }
@@ -59,39 +60,44 @@ impl Arm {
     }
 
     pub fn grab(&mut self) {
-        self.set_angle(0, SERVO0_GRAB, 1000);
-        self.set_angle(1, SERVO1_GRAB, 1000);
-        self.set_angle(2, ID2_ANGLE_OPEN, 1000);
-        sleep_ms(1500);
+        let a = config::get().arm;
+        self.set_angle(0, a.servo0_grab, a.grab_move_time_ms);
+        self.set_angle(1, a.servo1_grab, a.grab_move_time_ms);
+        self.set_angle(2, a.id2_angle_open, a.grab_move_time_ms);
+        sleep_ms(a.grab_settle_pre_close_ms);
 
-        self.set_angle(2, ID2_ANGLE_CLOSE, 1000);
-        sleep_ms(1000);
+        self.set_angle(2, a.id2_angle_close, a.grab_move_time_ms);
+        sleep_ms(a.grab_settle_close_ms);
 
-        self.set_angle(0, SERVO0_LIFT, 1000);
-        self.set_angle(1, SERVO1_LIFT, 1000);
-        sleep_ms(1200);
+        self.set_angle(0, a.servo0_lift, a.grab_move_time_ms);
+        self.set_angle(1, a.servo1_lift, a.grab_move_time_ms);
+        sleep_ms(a.grab_settle_lift_ms);
     }
 
     pub fn release_pos(&mut self) {
-        self.set_angle(0, SERVO0_READY, 1000);
-        self.set_angle(1, SERVO1_READY, 1000);
-        self.set_angle(2, ID2_ANGLE_OPEN, 1000);
+        let a = config::get().arm;
+        self.set_angle(0, a.servo0_ready, a.grab_move_time_ms);
+        self.set_angle(1, a.servo1_ready, a.grab_move_time_ms);
+        self.set_angle(2, a.id2_angle_open, a.grab_move_time_ms);
     }
 
     pub fn release(&mut self) {
-        self.set_angle(2, ID2_ANGLE_OPEN, 1000);
+        let a = config::get().arm;
+        self.set_angle(2, a.id2_angle_open, a.grab_move_time_ms);
     }
 
     pub fn grab_pos(&mut self) {
-        self.set_angle(0, SERVO0_READY, 1000);
-        self.set_angle(1, SERVO1_READY, 1000);
-        self.set_angle(2, ID2_ANGLE_OPEN, 1000);
+        let a = config::get().arm;
+        self.set_angle(0, a.servo0_ready, a.grab_move_time_ms);
+        self.set_angle(1, a.servo1_ready, a.grab_move_time_ms);
+        self.set_angle(2, a.id2_angle_open, a.grab_move_time_ms);
     }
 
     pub fn show(&mut self) {
-        self.set_angle(0, SERVO0_LIFT, 1000);
-        self.set_angle(1, SERVO1_LIFT, 1000);
-        self.set_angle(2, ID2_ANGLE_CLOSE, 1000);
+        let a = config::get().arm;
+        self.set_angle(0, a.servo0_lift, a.grab_move_time_ms);
+        self.set_angle(1, a.servo1_lift, a.grab_move_time_ms);
+        self.set_angle(2, a.id2_angle_close, a.grab_move_time_ms);
     }
 
     fn send_command(&mut self, command: &str) {
@@ -105,7 +111,10 @@ impl Arm {
 }
 
 fn angle_to_pulse(angle: f32) -> i32 {
-    ((500.0 + (angle / ANGLE_MAX) * 2000.0).round() as i32).clamp(PULSE_MIN, PULSE_MAX)
+    let a = config::get().arm;
+    let span = (a.pulse_max - a.pulse_min) as f32;
+    ((a.pulse_min as f32 + (angle / a.angle_max) * span).round() as i32)
+        .clamp(a.pulse_min, a.pulse_max)
 }
 
 fn sleep_ms(ms: u64) {

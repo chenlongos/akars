@@ -3,6 +3,11 @@ name = "akars"
 version = "0.1.0"
 edition = "2021"
 
+# Standalone crate: it ships its own toolchain, .cargo/config and Cargo.lock and
+# is built in isolation by scripts/build.sh. Declaring it a workspace root keeps
+# cargo from walking up into the enclosing repo when the tree is nested.
+[workspace]
+
 [dependencies]
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -10,6 +15,7 @@ tokio = { version = "1.52.3", features = ["net", "rt-multi-thread", "time"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 zune-core = "0.5"
 zune-jpeg = "0.5"
+toml = "0.8"
 
 [profile.release]
 lto = "thin"

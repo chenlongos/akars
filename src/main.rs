@@ -1,9 +1,10 @@
 use akars::arm::Arm;
 use akars::camera::UsbCamera;
+use akars::config::{self, DEFAULT_CONFIG_PATH};
 use akars::motor::{Motor, MotorConfig};
-use akars::robot::{install_signal_handlers, run_tennis_hunter, RobotConfig};
-use akars::tpu::{open_model, InferenceConfig};
-use akars::web::{serve, WebConfig};
+use akars::robot::{RobotConfig, install_signal_handlers, run_tennis_hunter};
+use akars::tpu::{InferenceConfig, open_model};
+use akars::web::{WebConfig, serve};
 use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -18,6 +19,7 @@ struct Cli {
     classes: i32,
     conf: f32,
     iou: f32,
+    config: PathBuf,
 }
 
 /// Arguments for the standalone TPU inference test: run a model on a single
@@ -52,6 +54,7 @@ struct ArmTestCli {
     servo1: f32,
     servo2: f32,
     time_ms: i32,
+    config: PathBuf,
 }
 
 #[derive(Debug)]
@@ -74,6 +77,7 @@ impl Default for Cli {
             classes: 1,
             conf: 0.5,
             iou: 0.5,
+            config: PathBuf::from(DEFAULT_CONFIG_PATH),
         }
     }
 }
@@ -110,6 +114,7 @@ impl Default for ArmTestCli {
             servo1: 0.0,
             servo2: 0.0,
             time_ms: 1000,
+            config: PathBuf::from(DEFAULT_CONFIG_PATH),
         }
     }
 }
@@ -129,12 +134,13 @@ fn main() {
             install_signal_handlers();
             run_hunt(cli);
         }
-        Command::Serve(config) => {
+        Command::Serve(web) => {
+            config::init(config::load(&web.config_path));
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .expect("failed to build tokio runtime");
-            if let Err(err) = runtime.block_on(serve(config)) {
+            if let Err(err) = runtime.block_on(serve(web)) {
                 eprintln!("[web] server failed: {err}");
                 std::process::exit(1);
             }
@@ -146,6 +152,7 @@ fn main() {
 }
 
 fn run_armtest(cli: ArmTestCli) {
+    config::init(config::load(&cli.config));
     let mut arm = match Arm::open(&cli.arm, 115200) {
         Ok(arm) => arm,
         Err(err) => {
@@ -166,6 +173,7 @@ fn run_armtest(cli: ArmTestCli) {
 }
 
 fn run_hunt(cli: Cli) {
+    config::init(config::load(&cli.config));
     let camera = match UsbCamera::open(&cli.camera) {
         Ok(camera) => {
             let info = camera.info();
@@ -190,9 +198,13 @@ fn run_hunt(cli: Cli) {
     };
     eprintln!("[dbg] model opened, opening motor {} ...", cli.motor);
 
+    let motor_file = config::get().motor;
     let motor_config = MotorConfig {
         device: cli.motor.clone(),
-        ..MotorConfig::default()
+        speed_scale: motor_file.speed_scale,
+        min_speed: motor_file.min_speed,
+        ppr: motor_file.ppr,
+        pwm_freq: motor_file.pwm_freq,
     };
     let motor = match Motor::open(&motor_config) {
         Ok(motor) => motor,
@@ -218,7 +230,7 @@ fn run_hunt(cli: Cli) {
         eprintln!("[dbg] --frames is ignored; the hunter runs until stopped");
     }
 
-    let config = RobotConfig {
+    let robot_config = RobotConfig {
         inference: InferenceConfig {
             classes_num: cli.classes,
             confidence_threshold: cli.conf,
@@ -226,7 +238,7 @@ fn run_hunt(cli: Cli) {
         },
     };
 
-    run_tennis_hunter(camera, model, motor, arm, config);
+    run_tennis_hunter(camera, model, motor, arm, robot_config);
 }
 
 fn run_detect(cli: DetectCli) {
@@ -405,13 +417,14 @@ fn parse_armtest_cli(args: impl Iterator<Item = String>) -> Result<ArmTestCli, S
                 std::process::exit(0);
             }
             "--arm" => cli.arm = take_value(&mut args, "--arm")?,
+            "--config" => cli.config = PathBuf::from(take_value(&mut args, "--config")?),
             "--time" => {
                 cli.time_ms = take_value(&mut args, "--time")?
                     .parse()
                     .map_err(|_| "--time expects an integer (ms)".to_string())?;
             }
             value if value.starts_with('-') => {
-                return Err(format!("unknown armtest option: {value}"))
+                return Err(format!("unknown armtest option: {value}"));
             }
             value => {
                 if positional.len() >= 3 {
@@ -449,6 +462,7 @@ fn parse_hunt_cli(args: impl Iterator<Item = String>) -> Result<Cli, String> {
             "--camera" => cli.camera = take_value(&mut args, "--camera")?,
             "--motor" => cli.motor = take_value(&mut args, "--motor")?,
             "--arm" => cli.arm = take_value(&mut args, "--arm")?,
+            "--config" => cli.config = PathBuf::from(take_value(&mut args, "--config")?),
             "--frames" => {
                 cli.frames = Some(
                     take_value(&mut args, "--frames")?
@@ -506,9 +520,10 @@ fn parse_serve_cli(args: impl Iterator<Item = String>) -> Result<WebConfig, Stri
             }
             "--motor" => config.motor_device = take_value(&mut args, "--motor")?,
             "--arm" => config.arm_device = take_value(&mut args, "--arm")?,
+            "--config" => config.config_path = PathBuf::from(take_value(&mut args, "--config")?),
             "--mock" => config.mock = true,
             value if value.starts_with('-') => {
-                return Err(format!("unknown serve option: {value}"))
+                return Err(format!("unknown serve option: {value}"));
             }
             value => return Err(format!("unexpected serve argument: {value}")),
         }
@@ -543,7 +558,7 @@ fn parse_detect_cli(args: impl Iterator<Item = String>) -> Result<DetectCli, Str
                     .map_err(|_| "--iou expects a float".to_string())?;
             }
             value if value.starts_with('-') => {
-                return Err(format!("unknown detect option: {value}"))
+                return Err(format!("unknown detect option: {value}"));
             }
             value => {
                 match positional {
@@ -584,7 +599,7 @@ fn parse_capture_cli(args: impl Iterator<Item = String>) -> Result<CaptureCli, S
             }
             "--bucket" => cli.bucket = true,
             value if value.starts_with('-') => {
-                return Err(format!("unknown capture option: {value}"))
+                return Err(format!("unknown capture option: {value}"));
             }
             value => {
                 match positional {
@@ -608,7 +623,7 @@ fn take_value(
 
 fn print_usage() {
     eprintln!(
-        "Usage:\n  akars <model.cvimodel> [--camera DEV] [--motor DEV] [--arm DEV] [--frames N] [--classes N] [--conf X] [--iou X]\n  akars serve [--listen HOST:PORT] [--motor DEV] [--arm DEV] [--mock]\n  akars detect <model.cvimodel> <image> [--out PATH] [--classes N] [--conf X] [--iou X]\n  akars capture [output.jpg] [--camera DEV] [--out PATH] [--warmup N]\n  akars armtest <servo0> <servo1> <servo2> [--arm DEV] [--time MS]"
+        "Usage:\n  akars <model.cvimodel> [--camera DEV] [--motor DEV] [--arm DEV] [--config PATH] [--frames N] [--classes N] [--conf X] [--iou X]\n  akars serve [--listen HOST:PORT] [--motor DEV] [--arm DEV] [--config PATH] [--mock]\n  akars detect <model.cvimodel> <image> [--out PATH] [--classes N] [--conf X] [--iou X]\n  akars capture [output.jpg] [--camera DEV] [--out PATH] [--warmup N]\n  akars armtest <servo0> <servo1> <servo2> [--arm DEV] [--time MS] [--config PATH]"
     );
 }
 
@@ -626,12 +641,12 @@ fn print_detect_usage() {
 
 fn print_web_usage() {
     eprintln!(
-        "Usage: akars serve [--listen HOST:PORT] [--motor DEV] [--arm DEV] [--mock]\n\nDefaults:\n  --listen 0.0.0.0:8080\n  --motor /dev/ttyS3\n  --arm /dev/ttyS2"
+        "Usage: akars serve [--listen HOST:PORT] [--motor DEV] [--arm DEV] [--config PATH] [--mock]\n\nDefaults:\n  --listen 0.0.0.0:8080\n  --motor /dev/ttyS3\n  --arm /dev/ttyS2\n  --config /root/akars.toml"
     );
 }
 
 fn print_armtest_usage() {
     eprintln!(
-        "Usage: akars armtest <servo0> <servo1> <servo2> [--arm DEV] [--time MS]\n\nSets three arm servo angles directly for debugging.\n\nDefaults:\n  --arm /dev/ttyS2\n  --time 1000"
+        "Usage: akars armtest <servo0> <servo1> <servo2> [--arm DEV] [--time MS] [--config PATH]\n\nSets three arm servo angles directly for debugging.\n\nDefaults:\n  --arm /dev/ttyS2\n  --time 1000"
     );
 }

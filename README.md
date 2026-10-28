@@ -64,6 +64,10 @@ partition:
 scripts/upload.sh /dev/sda2
 ```
 
+This also copies the motion-parameter config (`akars.toml`, falling back to
+`akars.example.toml`) to `/root/akars.toml`. An existing on-board config is kept
+unless you pass `--force-config`, so tuned values survive re-uploads.
+
 Run on device:
 
 ```bash
@@ -79,6 +83,37 @@ Useful options:
 - `--conf X`: confidence threshold, default `0.5`.
 - `--iou X`: NMS IOU threshold, default `0.5`.
 - `--classes N`: class count, default `1`.
+- `--config PATH`: motion-parameter config, default `/root/akars.toml`.
+
+## Motion parameter tuning
+
+The chassis (chasing, lane-keeping, turn pulses, approach-speed grading, search
+and back-off), the grab state machine (distance thresholds, confirm frames, per-
+phase durations), the arm (servo pose angles, pulse calibration, grasp timings)
+and the motor mapping (`speed_scale`, `min_speed`, `ppr`, `pwm_freq`) are read
+from a TOML file at startup instead of being compiled in. Edit the file and
+restart the program — no rebuild needed.
+
+- Default path is `/root/akars.toml` (next to the `/root/akars` binary);
+  override with `--config PATH`.
+- `akars.example.toml` in this directory lists every key with a one-line
+  description and the values calibrated on a real car. They are a starting
+  point, not neutral constants — servo angles, grab distances and the turn
+  polarity depend on the individual arm/claw mounting, so re-check them per
+  vehicle. Copy it to `/root/akars.toml` and edit.
+- The whole file, any `[section]`, or any single key may be omitted; a missing
+  value falls back to the compiled-in default declared in `src/config.rs`, which
+  mirrors the `pub(crate) const` values in `src/robot.rs` and `src/arm.rs`. Those
+  defaults are not repeated in the example file, so the numbers written there are
+  purely the tuned ones. A missing or unparseable file only prints a warning and
+  runs entirely on defaults.
+- Inference thresholds (`--conf` / `--iou` / `--classes`) and device paths stay
+  on the command line; only the motion parameters above are externalized.
+- `[grab] grab_turn_reverse = true` flips the pre-grab turn from left to right.
+  Chasing is closed-loop (it always corrects toward the ball), but the grab turn
+  is an open-loop fixed direction that assumes which side the claw sits on
+  relative to the camera. If the claw/camera mounting is mirrored on a different
+  car, set this to `true` instead of rebuilding.
 
 Test TPU inference on a single image:
 

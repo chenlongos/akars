@@ -3,6 +3,7 @@ use crate::arm::Arm;
 // 标了 `[桶流程已停用]` 的段落一起取消注释。`src/bucket.rs` 本身没有改动。
 // use crate::bucket::{self, BucketOutcome};
 use crate::camera::UsbCamera;
+use crate::config;
 use crate::detector::Detection;
 use crate::image_bridge;
 use crate::motor::Motor;
@@ -38,17 +39,31 @@ enum RobotStatus {
 enum GrabPhase {
     Idle,
     /// 太近:先后退一点再抓,免得把球顶飞。
-    Backoff { until: Instant },
+    Backoff {
+        until: Instant,
+    },
     /// 抓取前左转微调(补偿爪子相对相机的偏心),remaining 是还需再转的次数。
-    LeftTurn { until: Instant, remaining: i32 },
+    LeftTurn {
+        until: Instant,
+        remaining: i32,
+    },
     /// 两次左转之间停稳。
-    TurnGap { until: Instant, remaining: i32 },
+    TurnGap {
+        until: Instant,
+        remaining: i32,
+    },
     /// 爪子闭合,等伺服到位。
-    Closing { until: Instant },
+    Closing {
+        until: Instant,
+    },
     /// 松开,等伺服到位。
-    Releasing { until: Instant },
+    Releasing {
+        until: Instant,
+    },
     /// 爪子归位,到位后回到追球。
-    Homing { until: Instant },
+    Homing {
+        until: Instant,
+    },
 }
 
 /// 转向阶段。直道是连续的(不给差速),修正是离散的(脉冲 + 静置)—— 见 servo_step 的注释。
@@ -95,12 +110,12 @@ impl Default for RobotState {
 }
 
 // 参考帧宽度。像素类阈值(如中心死区)以此为基准按分辨率缩放,保证不同分辨率下行为一致。
-const REFERENCE_FRAME_WIDTH: f32 = 640.0;
+pub(crate) const REFERENCE_FRAME_WIDTH: f32 = 640.0;
 // 基础中心死区(像素,基于 640 宽)。球中心偏离画面中心在此范围内即视为“已居中”,不再转向,避免对着中心反复微调。
-const CENTER_MARGIN: i32 = 50;
+pub(crate) const CENTER_MARGIN: i32 = 50;
 // 中心死区随接近放大的系数。有效死区 = CENTER_MARGIN × (1 + 此值 × area_ratio);
 // 抓球前不再追求亚像素级居中(抓取自带左转补偿),近处放宽容差直接消除小幅 hunting。
-const MARGIN_PROXIMITY_GAIN: f32 = 2.0;
+pub(crate) const MARGIN_PROXIMITY_GAIN: f32 = 2.0;
 
 // ── 直线锁定(lane keeping) ───────────────────────────────────────────────
 // 三轮车(前二主动轮 + 后一从动轮),相机落在主动轮连线上 ⇒ 两轮同速下发就是严格直线
@@ -112,7 +127,7 @@ const MARGIN_PROXIMITY_GAIN: f32 = 2.0;
 //   1. 车道滞环(只在真跑偏时动作,不给检测抖动任何反应);
 //   2. 脉冲 + 静置(离散校正,不在运动中去测量);
 //   3. 预测刹车(用上一帧的行程量提前收油)。
-const LANE_BREAK_PX: i32 = 80;
+pub(crate) const LANE_BREAK_PX: i32 = 80;
 
 // ── 修正脉冲(跑偏后的离散校正) ──────────────────────────────────────────
 // **幅值恒定、时长正比于偏差** —— 对"最小动作就是一大格"的底盘来说,这是唯一能做出
@@ -136,29 +151,29 @@ const LANE_BREAK_PX: i32 = 80;
 //   2. 总转角不变: R' = R × (T+40)/(T+55.6),T∈[55,250] → 18.9 ~ 20.9
 // 两者下沿都跌破实测静摩擦下限 20(见上面 CHASE_SPEED 那段的下限约束),
 // 所以托底取 20 —— 更低的转速会"看着在下令、车不动"。
-const TURN_PULSE_SPEED: i32 = 20;
-const TURN_PULSE_SPEED_DIFF: i32 = 10;
-const TURN_PULSE_GAIN_MS: f32 = 250.0;
-const TURN_PULSE_MIN_MS: u64 = 55;
-const TURN_PULSE_MAX_MS: u64 = 250;
+pub(crate) const TURN_PULSE_SPEED: i32 = 20;
+pub(crate) const TURN_PULSE_SPEED_DIFF: i32 = 10;
+pub(crate) const TURN_PULSE_GAIN_MS: f32 = 250.0;
+pub(crate) const TURN_PULSE_MIN_MS: u64 = 55;
+pub(crate) const TURN_PULSE_MAX_MS: u64 = 250;
 // 脉冲后的静置:这段时间只走直线、不评估不修正,等转动惯性停稳再采下一帧。
 //
 // 这不是"低帧率时代遗留的 sleep",**而是相位裕度**:20fps + 约一帧延迟下,如果边转边测,
 // 读到的偏差永远是"上一帧的旧值 + 这一帧还在转"的叠加,于是必然过头、左右摆。
 // 摆头是在把这段静置删掉、改成"每帧连续修"之后才出现的 —— 别再把这条去掉。
-const CORRECT_SETTLE_MS: u64 = 100;
+pub(crate) const CORRECT_SETTLE_MS: u64 = 100;
 // 预测刹车的收油点:剩余偏差 ≥ 此值 × “一帧行程”时继续转,≤ 1 个行程时提前结束脉冲。
 // 2.0 = 多留一个行程的余量,抵掉轮子减速本身也要时间这件事。
-const BRAKE_TRAVEL_MARGIN: f32 = 2.0;
+pub(crate) const BRAKE_TRAVEL_MARGIN: f32 = 2.0;
 // 接近阻尼下限。原地旋转时越近的球在画面里划过越快;
 // 脉冲时长 × clamp(1 - area_ratio, 此值, 1),球越大(越近)脉冲压得越短,避免近处过冲。
-const PROXIMITY_DAMP_MIN: f32 = 0.35;
+pub(crate) const PROXIMITY_DAMP_MIN: f32 = 0.35;
 
 // 原地转的距离阈值。area_ratio ≥ 此值时,修正脉冲把前进分量丢掉,两轮等幅反向
 // (±TURN_PULSE_SPEED)—— 只转不走,免得近距离"边转边顶",用前进量把偏差推成位移。
 // 两轮的差仍是 2×TURN_PULSE_SPEED,所以角速度不变,少的只是前冲。
 // 直线/静置段不走这里(照常按 approach_speed 前进),所以接近不会因此停住。
-const TURN_INPLACE_AREA: f32 = 0.20;
+pub(crate) const TURN_INPLACE_AREA: f32 = 0.20;
 
 // ── 接近速度分级(面积比越大越近,越慢) ──────────────────────────────────
 // 静止球场景下最直接的提速手段:远处快跑,近了减速,免得冲到跟前才发现要抓。
@@ -171,35 +186,35 @@ const TURN_INPLACE_AREA: f32 = 0.20;
 //   40 → 40% / 32 → 34% / 26 → 30%      (满量程 85%)
 // 改之前是 26/22/20 → 30%/28%/26%,三档全挤在满量程三分之一附近 —— 这就是车慢的根源,
 // 提速的空间一直在,只是当初按"能推到球就行"调的。
-const CHASE_FAR_AREA: f32 = 0.15;
-const CHASE_MID_AREA: f32 = 0.30;
-const CHASE_SPEED_FAR: i32 = 40;
-const CHASE_SPEED_MID: i32 = 32;
-const CHASE_SPEED_NEAR: i32 = 26;
+pub(crate) const CHASE_FAR_AREA: f32 = 0.15;
+pub(crate) const CHASE_MID_AREA: f32 = 0.30;
+pub(crate) const CHASE_SPEED_FAR: i32 = 40;
+pub(crate) const CHASE_SPEED_MID: i32 = 32;
+pub(crate) const CHASE_SPEED_NEAR: i32 = 26;
 
 // ── 抓取状态机各段时长(按帧推进,不再阻塞主循环) ────────────────────────
 // 太近时后退的时长。
-const GRAB_BACKOFF_MS: u64 = 200;
+pub(crate) const GRAB_BACKOFF_MS: u64 = 200;
 // 抓取前每次左转微调的时长。
-const GRAB_LEFT_TURN_MS: u64 = 250;
+pub(crate) const GRAB_LEFT_TURN_MS: u64 = 250;
 // 两次左转微调之间的停稳间隔,以及爪子各动作后的等待。
-const GRAB_TURN_GAP_MS: u64 = 100;
-const GRAB_CLOSE_MS: u64 = 200;
-const GRAB_RELEASE_MS: u64 = 100;
-const GRAB_HOME_MS: u64 = 100;
+pub(crate) const GRAB_TURN_GAP_MS: u64 = 100;
+pub(crate) const GRAB_CLOSE_MS: u64 = 200;
+pub(crate) const GRAB_RELEASE_MS: u64 = 100;
+pub(crate) const GRAB_HOME_MS: u64 = 100;
 
 // 球框面积占画面比 ≥ 此值 → 认为“够近可抓”,是触发抓取的主要距离阈值。
-const GRAB_AREA: f32 = 0.40;
+pub(crate) const GRAB_AREA: f32 = 0.40;
 // 面积比 ≥ 此值 → “太近了”,先后退一点再抓,避免撞飞球。必须 > GRAB_AREA。
-const GRAB_AREA_MAX: f32 = 0.55;
+pub(crate) const GRAB_AREA_MAX: f32 = 0.55;
 
 // 抓取前小幅左转微调的次数(补偿爪子相对相机的安装偏心,把球挪到爪子正前方)。
-const GRAB_LEFT_TURN_COUNT: i32 = 3;
+pub(crate) const GRAB_LEFT_TURN_COUNT: i32 = 3;
 // 连续满足“够近且居中”的帧数达到此值才真正执行抓取,防单帧误检导致误抓。
-const GRAB_CONFIRM_THRESHOLD: i32 = 5;
+pub(crate) const GRAB_CONFIRM_THRESHOLD: i32 = 5;
 // 丢失宽限帧数。看到过球后若漏检,先原地保持不动等它重现,连续漏检超过此值才判定真丢并开始搜索,
 // 避免转向时的偶发漏检(运动模糊/擦边)立刻触发盲搜把球搞丢。
-const LOST_GRACE_FRAMES: i32 = 8;
+pub(crate) const LOST_GRACE_FRAMES: i32 = 8;
 
 // 没检测到球时原地慢转搜索的速度。转得快=扫过一圈快,但盲转过头会甩过球再转回来,
 // 所以它是"够快能扫到"的档,不是越快越好。
@@ -210,13 +225,13 @@ const LOST_GRACE_FRAMES: i32 = 8;
 // "球在眼前还是被甩过去"的来源,所以转速要按比例下调。
 //   帧率等比: 24 × 18/25 = 17.28
 // 下沿仍受实测静摩擦下限 20 约束(见上面 CHASE_SPEED 那段),故托底取 20。
-const IDLE_SPEED: i32 = 20;
+pub(crate) const IDLE_SPEED: i32 = 20;
 // 抓取前左转微调的速度。**别单独动它**:它是和 GRAB_LEFT_TURN_MS 配成一对标定出来的
 // ——"3 次 × 250ms"对应爪子偏心需要补的那个角度。只加速度不改时长,转过的角度按比例
 // 变大,球就被顶到爪子旁边而不是正前方了。要提速得两个一起按同比例改。
-const GRAB_LEFT_TURN_SPEED: i32 = 18;
+pub(crate) const GRAB_LEFT_TURN_SPEED: i32 = 18;
 // 太近(≥ GRAB_AREA_MAX)时的后退速度。快一点只是退得更远些,退多了下一轮自己会再靠上来。
-const BACKWARD_SPEED: i32 = 24;
+pub(crate) const BACKWARD_SPEED: i32 = 24;
 
 pub fn install_signal_handlers() {
     unsafe {
@@ -461,16 +476,18 @@ fn handle_detections(
         return None;
     }
 
+    let cfg = config::get();
+
     if detections.is_empty() {
         robot.grab_confirm_count = 0;
         robot.steer_phase = SteerPhase::Straight;
         robot.miss_count += 1;
 
-        if robot.miss_count <= LOST_GRACE_FRAMES {
+        if robot.miss_count <= cfg.grab.lost_grace_frames {
             // 宽限期内:刚才还看得到球,先停住等它重现,别急着盲搜。
             eprintln!(
                 "[detect] missed {}/{} frames, holding",
-                robot.miss_count, LOST_GRACE_FRAMES
+                robot.miss_count, cfg.grab.lost_grace_frames
             );
             motor.standby();
         } else {
@@ -479,10 +496,10 @@ fn handle_detections(
             let last_offset = robot.ball_cx - image_w / 2;
             if last_offset >= 0 {
                 eprintln!("[detect] ball lost, searching right (last seen right)");
-                motor.drive(IDLE_SPEED, -IDLE_SPEED);
+                motor.drive(cfg.chassis.idle_speed, -cfg.chassis.idle_speed);
             } else {
                 eprintln!("[detect] ball lost, searching left (last seen left)");
-                motor.drive(-IDLE_SPEED, IDLE_SPEED);
+                motor.drive(-cfg.chassis.idle_speed, cfg.chassis.idle_speed);
             }
         }
         return None;
@@ -515,13 +532,13 @@ fn handle_detections(
     );
 
     // 够近且居中:站定确认若干帧(防单帧误检),确认够了就交给抓取状态机。
-    if area_ratio >= GRAB_AREA && centered {
+    if area_ratio >= cfg.grab.grab_area && centered {
         robot.status = RobotStatus::GrabTennis;
         robot.grab_confirm_count += 1;
         robot.steer_phase = SteerPhase::Straight; // 已站定,滞环状态跟着复位
         motor.standby();
 
-        if robot.grab_confirm_count >= GRAB_CONFIRM_THRESHOLD {
+        if robot.grab_confirm_count >= cfg.grab.grab_confirm_threshold {
             start_grab(robot, area_ratio);
         }
         return Some(offset);
@@ -545,7 +562,14 @@ fn servo_step(
     robot: &mut RobotState,
     motor: &mut Motor,
 ) {
-    advance_steer_phase(robot, offset, prev_offset, image_w, area_ratio, Instant::now());
+    advance_steer_phase(
+        robot,
+        offset,
+        prev_offset,
+        image_w,
+        area_ratio,
+        Instant::now(),
+    );
 
     let forward = approach_speed(area_ratio);
     // 脉冲的前进分量:远处边走边修,近了归零 → 两轮等幅反向,原地转。
@@ -582,7 +606,7 @@ fn servo_step(
 
 /// 修正脉冲里保留多少前进分量:远处给全量(边走边修的差速),近处归零(原地转)。
 fn turn_forward_bias(forward: i32, area_ratio: f32) -> i32 {
-    if area_ratio >= TURN_INPLACE_AREA {
+    if area_ratio >= config::get().chassis.turn_inplace_area {
         0
     } else {
         forward
@@ -592,10 +616,11 @@ fn turn_forward_bias(forward: i32, area_ratio: f32) -> i32 {
 /// 修正脉冲的转向幅值,与 `turn_forward_bias` 同一个分界:近处原地转用实测过的
 /// `TURN_PULSE_SPEED`,远处差速段用小一档的 `TURN_PULSE_SPEED_DIFF`。
 fn turn_amplitude(area_ratio: f32) -> i32 {
-    if area_ratio >= TURN_INPLACE_AREA {
-        TURN_PULSE_SPEED
+    let chassis = config::get().chassis;
+    if area_ratio >= chassis.turn_inplace_area {
+        chassis.turn_pulse_speed
     } else {
-        TURN_PULSE_SPEED_DIFF
+        chassis.turn_pulse_speed_diff
     }
 }
 
@@ -627,7 +652,7 @@ fn advance_steer_phase(
 ) {
     match robot.steer_phase {
         SteerPhase::Straight => {
-            if offset.abs() > scaled_px(LANE_BREAK_PX, image_w) {
+            if offset.abs() > scaled_px(config::get().chassis.lane_break_px, image_w) {
                 let dir = if offset >= 0 { 1 } else { -1 };
                 robot.steer_phase = SteerPhase::Correcting {
                     until: now + Duration::from_millis(pulse_ms(offset, image_w, area_ratio)),
@@ -644,7 +669,7 @@ fn advance_steer_phase(
             );
             if braked || flipped || now >= until {
                 robot.steer_phase = SteerPhase::Settling {
-                    until: now + Duration::from_millis(CORRECT_SETTLE_MS),
+                    until: now + Duration::from_millis(config::get().chassis.correct_settle_ms),
                 };
             }
         }
@@ -658,17 +683,19 @@ fn advance_steer_phase(
 
 /// 修正脉冲时长:幅值恒定,时长正比于偏差(时间平均 = 细修正),夹在实测区间内。
 fn pulse_ms(offset: i32, image_w: i32, area_ratio: f32) -> u64 {
+    let chassis = config::get().chassis;
     let half_width = (image_w / 2).max(1) as f32;
     let norm = (offset.abs() as f32 / half_width).min(1.0);
-    let damp = (1.0 - area_ratio.max(0.0)).clamp(PROXIMITY_DAMP_MIN, 1.0);
-    (TURN_PULSE_GAIN_MS * norm * damp)
-        .round()
-        .clamp(TURN_PULSE_MIN_MS as f32, TURN_PULSE_MAX_MS as f32) as u64
+    let damp = (1.0 - area_ratio.max(0.0)).clamp(chassis.proximity_damp_min, 1.0);
+    (chassis.turn_pulse_gain_ms * norm * damp).round().clamp(
+        chassis.turn_pulse_min_ms as f32,
+        chassis.turn_pulse_max_ms as f32,
+    ) as u64
 }
 
 /// 按参考帧宽等比缩放一个像素阈值。
 fn scaled_px(px: i32, image_w: i32) -> i32 {
-    ((px as f32) * image_w as f32 / REFERENCE_FRAME_WIDTH)
+    ((px as f32) * image_w as f32 / config::get().chassis.reference_frame_width)
         .round()
         .max(1.0) as i32
 }
@@ -690,39 +717,42 @@ fn brake_scale(offset: i32, prev_offset: Option<i32>) -> f32 {
         // 没在收敛(还没转起来,或被前进带来的方位变化抵消)→ 不刹车。
         return 1.0;
     }
+    let margin = config::get().chassis.brake_travel_margin;
     let room = offset.abs() as f32;
-    ((room - travel) / (travel * (BRAKE_TRAVEL_MARGIN - 1.0))).clamp(0.0, 1.0)
+    ((room - travel) / (travel * (margin - 1.0))).clamp(0.0, 1.0)
 }
 
 /// 接近速度分级:远处快跑,近了减速。进入抓取距离(≥ GRAB_AREA)后返回 0,
 /// 那时只该对准、不该再往前顶。
 fn approach_speed(area_ratio: f32) -> i32 {
-    if area_ratio >= GRAB_AREA {
+    let cfg = config::get();
+    if area_ratio >= cfg.grab.grab_area {
         0
-    } else if area_ratio < CHASE_FAR_AREA {
-        CHASE_SPEED_FAR
-    } else if area_ratio < CHASE_MID_AREA {
-        CHASE_SPEED_MID
+    } else if area_ratio < cfg.chassis.chase_far_area {
+        cfg.chassis.chase_speed_far
+    } else if area_ratio < cfg.chassis.chase_mid_area {
+        cfg.chassis.chase_speed_mid
     } else {
-        CHASE_SPEED_NEAR
+        cfg.chassis.chase_speed_near
     }
 }
 
 /// 确认够近且居中后进入抓取序列。太近的话先安排一段后退,否则直接开始左转微调。
 fn start_grab(robot: &mut RobotState, area_ratio: f32) {
     let now = Instant::now();
+    let cfg = config::get();
     robot.grab_confirm_count = 0;
     robot.steer_phase = SteerPhase::Straight;
 
-    if area_ratio >= GRAB_AREA_MAX {
+    if area_ratio >= cfg.grab.grab_area_max {
         eprintln!("[grab] too close, backing up first");
         robot.grab_phase = GrabPhase::Backoff {
-            until: now + Duration::from_millis(GRAB_BACKOFF_MS),
+            until: now + Duration::from_millis(cfg.grab.grab_backoff_ms),
         };
     } else {
         robot.grab_phase = GrabPhase::LeftTurn {
-            until: now + Duration::from_millis(GRAB_LEFT_TURN_MS),
-            remaining: GRAB_LEFT_TURN_COUNT - 1,
+            until: now + Duration::from_millis(cfg.grab.grab_left_turn_ms),
+            remaining: cfg.grab.grab_left_turn_count - 1,
         };
     }
 }
@@ -739,7 +769,7 @@ fn finish_grab(robot: &mut RobotState, now: Instant) {
     //   }
     // 现在不再找桶,统一走原地放开。
     robot.grab_phase = GrabPhase::Closing {
-        until: now + Duration::from_millis(GRAB_CLOSE_MS),
+        until: now + Duration::from_millis(config::get().grab.grab_close_ms),
     };
 }
 
@@ -747,30 +777,33 @@ fn finish_grab(robot: &mut RobotState, now: Instant) {
 /// 底盘指令按帧重发(ESP32 锁存目标转速,重发只是保险,不会叠加)。
 fn advance_grab(robot: &mut RobotState, motor: &mut Motor, arm: &mut Arm) {
     let now = Instant::now();
+    let cfg = config::get();
 
     match robot.grab_phase {
         GrabPhase::Idle => {}
 
         GrabPhase::Backoff { until } => {
             if now < until {
-                motor.backward(BACKWARD_SPEED);
+                motor.backward(cfg.chassis.backward_speed);
                 return;
             }
             motor.standby();
             robot.grab_phase = GrabPhase::LeftTurn {
-                until: now + Duration::from_millis(GRAB_LEFT_TURN_MS),
-                remaining: GRAB_LEFT_TURN_COUNT - 1,
+                until: now + Duration::from_millis(cfg.grab.grab_left_turn_ms),
+                remaining: cfg.grab.grab_left_turn_count - 1,
             };
         }
 
         GrabPhase::LeftTurn { until, remaining } => {
             if now < until {
-                motor.drive(-GRAB_LEFT_TURN_SPEED, GRAB_LEFT_TURN_SPEED);
+                let (l, r) =
+                    grab_turn_wheels(cfg.grab.grab_left_turn_speed, cfg.grab.grab_turn_reverse);
+                motor.drive(l, r);
                 return;
             }
             motor.standby();
             robot.grab_phase = GrabPhase::TurnGap {
-                until: now + Duration::from_millis(GRAB_TURN_GAP_MS),
+                until: now + Duration::from_millis(cfg.grab.grab_turn_gap_ms),
                 remaining,
             };
         }
@@ -781,7 +814,7 @@ fn advance_grab(robot: &mut RobotState, motor: &mut Motor, arm: &mut Arm) {
             }
             if remaining > 0 {
                 robot.grab_phase = GrabPhase::LeftTurn {
-                    until: now + Duration::from_millis(GRAB_LEFT_TURN_MS),
+                    until: now + Duration::from_millis(cfg.grab.grab_left_turn_ms),
                     remaining: remaining - 1,
                 };
             } else {
@@ -800,7 +833,7 @@ fn advance_grab(robot: &mut RobotState, motor: &mut Motor, arm: &mut Arm) {
             // 位移;grab_pos() 会把爪子一起置为 OPEN —— 球就是在这里放开的。
             arm.grab_pos();
             robot.grab_phase = GrabPhase::Releasing {
-                until: now + Duration::from_millis(GRAB_RELEASE_MS),
+                until: now + Duration::from_millis(cfg.grab.grab_release_ms),
             };
         }
 
@@ -811,7 +844,7 @@ fn advance_grab(robot: &mut RobotState, motor: &mut Motor, arm: &mut Arm) {
             // 爪子在上一步已经张开,这里是幂等重发,确保夹爪确实松开。
             arm.release();
             robot.grab_phase = GrabPhase::Homing {
-                until: now + Duration::from_millis(GRAB_HOME_MS),
+                until: now + Duration::from_millis(cfg.grab.grab_home_ms),
             };
         }
 
@@ -828,34 +861,42 @@ fn advance_grab(robot: &mut RobotState, motor: &mut Motor, arm: &mut Arm) {
     }
 }
 
+/// 抓取微调时左右轮的目标转速:`reverse` 为假时左转(前-后/后-前),
+/// 为真时镜像成右转。把方向定义从调用点抽出来,便于单测验证两种极性和。
+fn grab_turn_wheels(speed: i32, reverse: bool) -> (i32, i32) {
+    if reverse {
+        (speed, -speed)
+    } else {
+        (-speed, speed)
+    }
+}
+
 fn scaled_center_margin(image_w: i32) -> i32 {
-    ((CENTER_MARGIN as f32) * image_w as f32 / REFERENCE_FRAME_WIDTH)
+    let chassis = config::get().chassis;
+    ((chassis.center_margin as f32) * image_w as f32 / chassis.reference_frame_width)
         .round()
         .max(1.0) as i32
 }
 
 fn proximity_center_margin(image_w: i32, area_ratio: f32) -> i32 {
     let base = scaled_center_margin(image_w) as f32;
-    (base * (1.0 + MARGIN_PROXIMITY_GAIN * area_ratio.max(0.0)))
-        .round()
-        .max(1.0) as i32
+    let gain = config::get().chassis.margin_proximity_gain;
+    (base * (1.0 + gain * area_ratio.max(0.0))).round().max(1.0) as i32
 }
 
 fn sleep_us(us: u64) {
     thread::sleep(Duration::from_micros(us));
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_grab, advance_steer_phase, approach_speed, brake_scale, finish_grab,
-        proximity_center_margin, pulse_ms, scaled_center_margin, scaled_px, turn_amplitude,
-        turn_forward_bias, GrabPhase, RobotState, RobotStatus, SteerPhase, CHASE_SPEED_FAR,
-        CHASE_SPEED_MID,
-        CHASE_SPEED_NEAR, CORRECT_SETTLE_MS, GRAB_AREA, LANE_BREAK_PX, TURN_INPLACE_AREA,
+        CHASE_SPEED_FAR, CHASE_SPEED_MID, CHASE_SPEED_NEAR, CORRECT_SETTLE_MS, GRAB_AREA,
+        GrabPhase, LANE_BREAK_PX, RobotState, RobotStatus, SteerPhase, TURN_INPLACE_AREA,
         TURN_PULSE_GAIN_MS, TURN_PULSE_MAX_MS, TURN_PULSE_MIN_MS, TURN_PULSE_SPEED,
-        TURN_PULSE_SPEED_DIFF,
+        TURN_PULSE_SPEED_DIFF, advance_grab, advance_steer_phase, approach_speed, brake_scale,
+        finish_grab, grab_turn_wheels, proximity_center_margin, pulse_ms, scaled_center_margin,
+        scaled_px, turn_amplitude, turn_forward_bias,
     };
     use crate::arm::Arm;
     use crate::motor::Motor;
@@ -932,10 +973,16 @@ mod tests {
 
         // 到点 → 静置(这段时间只走直线,等惯性停稳)。
         step(&mut robot, 300, 0.05, until);
-        let SteerPhase::Settling { until: settle_until } = robot.steer_phase else {
+        let SteerPhase::Settling {
+            until: settle_until,
+        } = robot.steer_phase
+        else {
             panic!("expected Settling, got {:?}", robot.steer_phase);
         };
-        assert_eq!(settle_until - until, Duration::from_millis(CORRECT_SETTLE_MS));
+        assert_eq!(
+            settle_until - until,
+            Duration::from_millis(CORRECT_SETTLE_MS)
+        );
 
         // 静置中即使偏差还很大也不修 —— 这就是相位裕度,防止边转边测导致左右摆。
         step(&mut robot, 300, 0.05, until + Duration::from_millis(1));
@@ -1025,7 +1072,10 @@ mod tests {
     fn turn_pulse_keeps_forward_bias_far_away() {
         // 远处:边走边修,前进分量照给 —— 两轮同向,只是快慢不同。
         assert_eq!(turn_forward_bias(CHASE_SPEED_FAR, 0.10), CHASE_SPEED_FAR);
-        assert_eq!(turn_forward_bias(CHASE_SPEED_MID, TURN_INPLACE_AREA - 0.01), CHASE_SPEED_MID);
+        assert_eq!(
+            turn_forward_bias(CHASE_SPEED_MID, TURN_INPLACE_AREA - 0.01),
+            CHASE_SPEED_MID
+        );
     }
 
     #[test]
@@ -1034,8 +1084,10 @@ mod tests {
         for area in [TURN_INPLACE_AREA, 0.25, 0.30, 0.35, GRAB_AREA] {
             let bias = turn_forward_bias(approach_speed(area), area);
             assert_eq!(bias, 0, "area={area} 应该原地转");
-            assert_eq!((bias + TURN_PULSE_SPEED, bias - TURN_PULSE_SPEED),
-                       (TURN_PULSE_SPEED, -TURN_PULSE_SPEED));
+            assert_eq!(
+                (bias + TURN_PULSE_SPEED, bias - TURN_PULSE_SPEED),
+                (TURN_PULSE_SPEED, -TURN_PULSE_SPEED)
+            );
         }
     }
 
@@ -1043,10 +1095,16 @@ mod tests {
     fn differential_turn_is_gentler_than_in_place() {
         // 差速段(远处)单独用小一档幅值,原地转那档不受影响。
         assert_eq!(turn_amplitude(0.10), TURN_PULSE_SPEED_DIFF);
-        assert_eq!(turn_amplitude(TURN_INPLACE_AREA - 0.01), TURN_PULSE_SPEED_DIFF);
+        assert_eq!(
+            turn_amplitude(TURN_INPLACE_AREA - 0.01),
+            TURN_PULSE_SPEED_DIFF
+        );
         assert_eq!(turn_amplitude(TURN_INPLACE_AREA), TURN_PULSE_SPEED);
         assert_eq!(turn_amplitude(0.30), TURN_PULSE_SPEED);
-        assert!(TURN_PULSE_SPEED_DIFF < TURN_PULSE_SPEED, "差速段要比原地转轻");
+        assert!(
+            TURN_PULSE_SPEED_DIFF < TURN_PULSE_SPEED,
+            "差速段要比原地转轻"
+        );
         assert!(TURN_PULSE_SPEED_DIFF > 0);
     }
 
@@ -1115,8 +1173,14 @@ mod tests {
         };
         advance_grab(&mut robot, &mut motor, &mut arm);
 
-        assert!(matches!(robot.grab_phase, GrabPhase::Idle), "应回到空闲,准备抓下一个球");
-        assert!(matches!(robot.status, RobotStatus::ChaseTennis), "应恢复追球");
+        assert!(
+            matches!(robot.grab_phase, GrabPhase::Idle),
+            "应回到空闲,准备抓下一个球"
+        );
+        assert!(
+            matches!(robot.status, RobotStatus::ChaseTennis),
+            "应恢复追球"
+        );
         assert_eq!(robot.miss_count, 0);
         assert_eq!(robot.grab_confirm_count, 0);
     }
@@ -1133,7 +1197,10 @@ mod tests {
         };
         let (mut motor, mut arm) = (Motor::mock(), Arm::mock());
         advance_grab(&mut robot, &mut motor, &mut arm);
-        assert!(matches!(robot.grab_phase, GrabPhase::LeftTurn { remaining: 1, .. }));
+        assert!(matches!(
+            robot.grab_phase,
+            GrabPhase::LeftTurn { remaining: 1, .. }
+        ));
     }
 
     /// RobotState 必须保持 Copy:主循环把它当值传递。
@@ -1153,5 +1220,18 @@ mod tests {
         assert!(CHASE_SPEED_FAR > CHASE_SPEED_MID && CHASE_SPEED_MID > CHASE_SPEED_NEAR);
         // 最低档不能低于实测能推得动整车的量级(老 CHASE_SPEED = 20)。
         assert!(CHASE_SPEED_NEAR >= 20);
+    }
+
+    /// grab_turn_reverse 把抓取微调的两轮目标镜像,从而切换左/右转。
+    #[test]
+    fn grab_turn_reverse_mirrors_wheels() {
+        // 默认(不翻转):左轮回退、右轮前进 = 左转。
+        assert_eq!(grab_turn_wheels(18, false), (-18, 18));
+        // 翻转后:左右互换 = 右转。
+        assert_eq!(grab_turn_wheels(18, true), (18, -18));
+        // 两种极性互为镜像,幅值不变(角速度大小不受翻转影响)。
+        let (l, r) = grab_turn_wheels(18, false);
+        let (rl, rr) = grab_turn_wheels(18, true);
+        assert_eq!((rl, rr), (r, l));
     }
 }
