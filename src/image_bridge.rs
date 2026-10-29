@@ -373,6 +373,19 @@ fn scale_plane(src: &[u8], src_w: usize, src_h: usize, win: &mut PlaneWindow<'_>
     if src_w == 0 || src_h == 0 || win.w == 0 || win.h == 0 {
         return;
     }
+    // Identity window: the letterbox landed the source 1:1 (uniform scale == 1.0,
+    // e.g. a 16:9 640x360 capture centered into a 4:3 640x480 tensor, which is a
+    // pure vertical pad with no resampling). Every interpolation weight is 0 here,
+    // so copying rows verbatim is byte-for-byte identical to the fixed-point path
+    // below yet avoids a per-pixel multiply-accumulate over the whole frame.
+    if src_w == win.w && src_h == win.h {
+        for row in 0..src_h {
+            let s = row * src_w;
+            let d = (win.y + row) * win.stride + win.x;
+            win.buf[d..d + src_w].copy_from_slice(&src[s..s + src_w]);
+        }
+        return;
+    }
     // Fixed-point weights (0..=256) match `interpolate_channel` so scaled and
     // unscaled frames stay visually consistent.
     let mut x_cache = InterpolationCache::default();
@@ -1145,6 +1158,39 @@ mod tests {
             60, 70, 128, 128, // V: avg(50,70), avg(60,80), pad
         ];
         assert_eq!(&dst[..], &expected[..]);
+    }
+
+    #[test]
+    fn vertical_pad_blit_lands_each_row_verbatim() {
+        // Guards the identity-window blit: same width, shorter height means a
+        // centered vertical letterbox with zero horizontal resampling. Each source
+        // luma row must be copied verbatim to (pad_top + row), and the pad rows to
+        // 0. Distinct per-row markers catch any row-order or pad_top offset error
+        // that a symmetric small fixture could hide.
+        let (sw, sh, dw, dh) = (6usize, 4usize, 6usize, 8usize);
+        let mut src = vec![0u8; sw * sh + 2 * (sw / 2) * sh];
+        for r in 0..sh {
+            for c in 0..sw {
+                src[r * sw + c] = (r as u8 + 1) * 10 + c as u8; // row-dominant markers
+            }
+        }
+
+        let mut dst = vec![0xEE; dw * dh + 2 * (dw / 2) * (dh / 2)];
+        yuv422p_to_yuv420p_scaled(&src, &mut dst, sw as i32, sh as i32, dw as i32, dh as i32)
+            .unwrap();
+
+        let pad_top = (dh - sh) / 2; // 2 luma rows
+        for r in 0..dh {
+            for c in 0..dw {
+                let got = dst[r * dw + c];
+                if r < pad_top || r >= pad_top + sh {
+                    assert_eq!(got, 0, "pad luma row {r}");
+                } else {
+                    let sr = r - pad_top;
+                    assert_eq!(got, src[sr * sw + c], "copied row {r} col {c}");
+                }
+            }
+        }
     }
 
     #[test]
