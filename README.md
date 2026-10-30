@@ -109,14 +109,18 @@ restart the program — no rebuild needed.
   runs entirely on defaults.
 - Inference thresholds (`--conf` / `--iou` / `--classes`) and device paths stay
   on the command line; only the motion parameters above are externalized.
-- `[chassis] turn_reverse = true` mirrors the left/right steering polarity for
-  the whole chassis: the chase correction, the lost-ball search turn, and the
-  open-loop pre-grab turn all read this one switch. It is meant for boards whose
-  two motor channels are wired to the opposite sides (a "left" command physically
-  turns right). Chasing is normally closed-loop (it corrects toward the ball) but
-  still inherits the mirror so all three paths stay consistent; the pre-grab turn
-  is an open-loop fixed direction that relies on the same value. Use `false` for
-  a normally wired car instead of rebuilding.
+- `[chassis] turn_reverse = true` mirrors the left/right steering polarity for the
+  two closed-loop paths — the chase correction and the lost-ball search turn. It is
+  meant for boards whose two motor channels are wired to the opposite sides (a
+  "left" command physically turns right). Chasing is normally closed-loop (it
+  corrects toward the ball) but still inherits the mirror so both paths stay
+  consistent. Use `false` for a normally wired car instead of rebuilding.
+- `[grab] grab_turn_direction = "left" | "right"` sets the open-loop pre-grab turn
+  side on its own, independent of `turn_reverse`. Because the claw sits off-center
+  from the camera and that offset side varies with how the arm is mounted, different
+  cars need to turn toward different sides to bring the ball in front of the claw,
+  so this is an explicit per-car calibration value rather than something derived from
+  the wiring polarity.
 
 Test TPU inference on a single image:
 

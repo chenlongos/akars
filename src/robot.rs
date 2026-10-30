@@ -42,12 +42,13 @@ enum GrabPhase {
     Backoff {
         until: Instant,
     },
-    /// 抓取前左转微调(补偿爪子相对相机的偏心),remaining 是还需再转的次数。
-    LeftTurn {
+    /// 抓取前盲转微调(补偿爪子相对相机的偏心,方向由 grab_turn_direction 决定),
+    /// remaining 是还需再转的次数。
+    Turn {
         until: Instant,
         remaining: i32,
     },
-    /// 两次左转之间停稳。
+    /// 两次盲转之间停稳。
     TurnGap {
         until: Instant,
         remaining: i32,
@@ -195,9 +196,9 @@ pub(crate) const CHASE_SPEED_NEAR: i32 = 26;
 // ── 抓取状态机各段时长(按帧推进,不再阻塞主循环) ────────────────────────
 // 太近时后退的时长。
 pub(crate) const GRAB_BACKOFF_MS: u64 = 200;
-// 抓取前每次左转微调的时长。
-pub(crate) const GRAB_LEFT_TURN_MS: u64 = 250;
-// 两次左转微调之间的停稳间隔,以及爪子各动作后的等待。
+// 抓取前每次盲转微调的时长。
+pub(crate) const GRAB_TURN_MS: u64 = 250;
+// 两次盲转微调之间的停稳间隔,以及爪子各动作后的等待。
 pub(crate) const GRAB_TURN_GAP_MS: u64 = 100;
 pub(crate) const GRAB_CLOSE_MS: u64 = 200;
 pub(crate) const GRAB_RELEASE_MS: u64 = 100;
@@ -208,8 +209,8 @@ pub(crate) const GRAB_AREA: f32 = 0.40;
 // 面积比 ≥ 此值 → “太近了”,先后退一点再抓,避免撞飞球。必须 > GRAB_AREA。
 pub(crate) const GRAB_AREA_MAX: f32 = 0.55;
 
-// 抓取前小幅左转微调的次数(补偿爪子相对相机的安装偏心,把球挪到爪子正前方)。
-pub(crate) const GRAB_LEFT_TURN_COUNT: i32 = 3;
+// 抓取前小幅盲转微调的次数(补偿爪子相对相机的安装偏心,把球挪到爪子正前方)。
+pub(crate) const GRAB_TURN_COUNT: i32 = 3;
 // 连续满足“够近且居中”的帧数达到此值才真正执行抓取,防单帧误检导致误抓。
 pub(crate) const GRAB_CONFIRM_THRESHOLD: i32 = 5;
 // 丢失宽限帧数。看到过球后若漏检,先原地保持不动等它重现,连续漏检超过此值才判定真丢并开始搜索,
@@ -226,10 +227,10 @@ pub(crate) const LOST_GRACE_FRAMES: i32 = 8;
 //   帧率等比: 24 × 18/25 = 17.28
 // 下沿仍受实测静摩擦下限 20 约束(见上面 CHASE_SPEED 那段),故托底取 20。
 pub(crate) const IDLE_SPEED: i32 = 20;
-// 抓取前左转微调的速度。**别单独动它**:它是和 GRAB_LEFT_TURN_MS 配成一对标定出来的
+// 抓取前盲转微调的速度。**别单独动它**:它是和 GRAB_TURN_MS 配成一对标定出来的
 // ——"3 次 × 250ms"对应爪子偏心需要补的那个角度。只加速度不改时长,转过的角度按比例
 // 变大,球就被顶到爪子旁边而不是正前方了。要提速得两个一起按同比例改。
-pub(crate) const GRAB_LEFT_TURN_SPEED: i32 = 18;
+pub(crate) const GRAB_TURN_SPEED: i32 = 18;
 // 太近(≥ GRAB_AREA_MAX)时的后退速度。快一点只是退得更远些,退多了下一轮自己会再靠上来。
 pub(crate) const BACKWARD_SPEED: i32 = 24;
 
@@ -582,7 +583,7 @@ fn servo_step(
     let forward = approach_speed(area_ratio);
     // 脉冲的前进分量:远处边走边修,近了归零 → 两轮等幅反向,原地转。
     let bias = turn_forward_bias(forward, area_ratio);
-    // 全局转向极性:`[chassis] turn_reverse` 置 true 时镜像左右,与追球/搜索/抓取共用。
+    // 全局转向极性:`[chassis] turn_reverse` 置 true 时镜像左右,追球与搜索共用。
     let polarity = if config::get().chassis.turn_reverse {
         -1
     } else {
@@ -620,7 +621,8 @@ fn servo_step(
 
 /// 把名义转向 `dir`(±1)与全局极性 `polarity`(±1)合成轮用的转向量。
 /// `polarity` 来自 `[chassis] turn_reverse`:通道与物理左右反接的底盘用它把
-/// 追球 / 搜索 / 抓取三条路一起翻回正确方向(见 servo_step / handle_detections / advance_grab)。
+/// 追球 / 搜索两条闭回路一起翻回正确方向(见 servo_step / handle_detections)。
+/// 抓取盲转不接本极性,方向由 `[grab] grab_turn_direction` 单独指定。
 fn steer_turn(dir: i32, amplitude: i32, polarity: i32) -> i32 {
     dir * amplitude * polarity
 }
@@ -771,9 +773,9 @@ fn start_grab(robot: &mut RobotState, area_ratio: f32) {
             until: now + Duration::from_millis(cfg.grab.grab_backoff_ms),
         };
     } else {
-        robot.grab_phase = GrabPhase::LeftTurn {
-            until: now + Duration::from_millis(cfg.grab.grab_left_turn_ms),
-            remaining: cfg.grab.grab_left_turn_count - 1,
+        robot.grab_phase = GrabPhase::Turn {
+            until: now + Duration::from_millis(cfg.grab.grab_turn_ms),
+            remaining: cfg.grab.grab_turn_count - 1,
         };
     }
 }
@@ -809,16 +811,16 @@ fn advance_grab(robot: &mut RobotState, motor: &mut Motor, arm: &mut Arm) {
                 return;
             }
             motor.standby();
-            robot.grab_phase = GrabPhase::LeftTurn {
-                until: now + Duration::from_millis(cfg.grab.grab_left_turn_ms),
-                remaining: cfg.grab.grab_left_turn_count - 1,
+            robot.grab_phase = GrabPhase::Turn {
+                until: now + Duration::from_millis(cfg.grab.grab_turn_ms),
+                remaining: cfg.grab.grab_turn_count - 1,
             };
         }
 
-        GrabPhase::LeftTurn { until, remaining } => {
+        GrabPhase::Turn { until, remaining } => {
             if now < until {
                 let (l, r) =
-                    grab_turn_wheels(cfg.grab.grab_left_turn_speed, cfg.chassis.turn_reverse);
+                    grab_turn_wheels(cfg.grab.grab_turn_speed, cfg.grab.grab_turn_direction);
                 motor.drive(l, r);
                 return;
             }
@@ -834,8 +836,8 @@ fn advance_grab(robot: &mut RobotState, motor: &mut Motor, arm: &mut Arm) {
                 return;
             }
             if remaining > 0 {
-                robot.grab_phase = GrabPhase::LeftTurn {
-                    until: now + Duration::from_millis(cfg.grab.grab_left_turn_ms),
+                robot.grab_phase = GrabPhase::Turn {
+                    until: now + Duration::from_millis(cfg.grab.grab_turn_ms),
                     remaining: remaining - 1,
                 };
             } else {
@@ -882,13 +884,13 @@ fn advance_grab(robot: &mut RobotState, motor: &mut Motor, arm: &mut Arm) {
     }
 }
 
-/// 抓取微调时左右轮的目标转速:`reverse` 为假时左转(前-后/后-前),
-/// 为真时镜像成右转。`reverse` 传入 `[chassis] turn_reverse`,与追球/搜索共用同一极性开关。
-fn grab_turn_wheels(speed: i32, reverse: bool) -> (i32, i32) {
-    if reverse {
-        (speed, -speed)
-    } else {
-        (-speed, speed)
+/// 抓取盲转阶段左右轮的目标转速:方向直接由 `[grab] grab_turn_direction` 给出,
+/// `Left` 为左轮回退、右轮前进(前-后/后-前),`Right` 镜像成左轮前进、右轮回退。
+/// 不叠加底盘接线极性(那是追球/搜索的事)。
+fn grab_turn_wheels(speed: i32, direction: config::GrabTurnDirection) -> (i32, i32) {
+    match direction {
+        config::GrabTurnDirection::Right => (speed, -speed),
+        config::GrabTurnDirection::Left => (-speed, speed),
     }
 }
 
@@ -920,6 +922,7 @@ mod tests {
         scaled_px, steer_turn, turn_amplitude, turn_forward_bias,
     };
     use crate::arm::Arm;
+    use crate::config::GrabTurnDirection;
     use crate::motor::Motor;
     use std::time::{Duration, Instant};
 
@@ -1220,7 +1223,7 @@ mod tests {
         advance_grab(&mut robot, &mut motor, &mut arm);
         assert!(matches!(
             robot.grab_phase,
-            GrabPhase::LeftTurn { remaining: 1, .. }
+            GrabPhase::Turn { remaining: 1, .. }
         ));
     }
 
@@ -1243,30 +1246,31 @@ mod tests {
         assert!(CHASE_SPEED_NEAR >= 20);
     }
 
-    /// `[chassis] turn_reverse`(经 `grab_turn_wheels` 的 `reverse`)把抓取微调的两轮目标镜像。
+    /// 抓取盲转方向把两轮目标镜像:`Left` 左转、`Right` 右转。
     #[test]
-    fn grab_turn_wheels_mirrors_wheels() {
-        // 默认(不翻转):左轮回退、右轮前进 = 左转。
-        assert_eq!(grab_turn_wheels(18, false), (-18, 18));
-        // 翻转后:左右互换 = 右转。
-        assert_eq!(grab_turn_wheels(18, true), (18, -18));
-        // 两种极性互为镜像,幅值不变(角速度大小不受翻转影响)。
-        let (l, r) = grab_turn_wheels(18, false);
-        let (rl, rr) = grab_turn_wheels(18, true);
+    fn grab_turn_direction_mirrors_wheels() {
+        // Left:左轮回退、右轮前进 = 左转。
+        assert_eq!(grab_turn_wheels(18, GrabTurnDirection::Left), (-18, 18));
+        // Right:左右互换 = 右转。
+        assert_eq!(grab_turn_wheels(18, GrabTurnDirection::Right), (18, -18));
+        // 两种方向互为镜像,幅值不变(角速度大小不受方向影响)。
+        let (l, r) = grab_turn_wheels(18, GrabTurnDirection::Left);
+        let (rl, rr) = grab_turn_wheels(18, GrabTurnDirection::Right);
         assert_eq!((rl, rr), (r, l));
     }
 
-    /// 同一个 `turn_reverse` 开关同时驱动追球转向与抓取盲转的极性镜像。
+    /// `[chassis] turn_reverse` 只镜像追球/搜索的接线极性;抓取盲转方向独立,
+    /// 由 `[grab] grab_turn_direction` 决定,不受本开关影响。
     #[test]
-    fn turn_reverse_shares_one_polarity_across_paths() {
+    fn turn_reverse_mirrors_chase_and_search_only() {
         // 追球:球在左 (dir=-1)。默认极性不翻转 → 名义左转。
         assert_eq!(steer_turn(-1, TURN_PULSE_SPEED, 1), -TURN_PULSE_SPEED);
         // 通道反接 (polarity=-1) → 转向量镜像,经反接接线后物理仍朝球一侧。
         assert_eq!(steer_turn(-1, TURN_PULSE_SPEED, -1), TURN_PULSE_SPEED);
         // 幅值与极性无关,只改方向。
         assert_eq!(steer_turn(1, 12, -1).abs(), 12);
-        // 抓取盲转读同一个 bool:true 时两轮镜像(与旧的 grab_turn_reverse=true 等价)。
-        assert_eq!(grab_turn_wheels(18, true), (18, -18));
-        assert_eq!(grab_turn_wheels(18, false), (-18, 18));
+        // 抓取盲转不吃 turn_reverse:同一方向给出固定两轮目标,与极性开关无关。
+        assert_eq!(grab_turn_wheels(18, GrabTurnDirection::Left), (-18, 18));
+        assert_eq!(grab_turn_wheels(18, GrabTurnDirection::Right), (18, -18));
     }
 }

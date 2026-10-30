@@ -28,19 +28,20 @@ chase_speed_mid = 25         # 中处接近速度
 chase_speed_near = 20         # 近处接近速度(不低于实测能推动整车的下限)
 idle_speed = 25               # 丢球后原地慢转搜索速度
 backward_speed = 30           # 太近时的后退速度
-turn_reverse = true           # 全局转向极性:轮子通道与物理左右反接时置 true,同时纠正追球/搜索/抓取(正常接线用 false)
+turn_reverse = false           # 全局转向极性:轮子通道与物理左右反接时置 true,同时纠正追球/搜索(正常接线用 false;抓取盲转方向看 grab_turn_direction)
 
 # ── 抓取状态机:距离阈值、确认帧数、各段时长 ──
 [grab]
 grab_area = 0.25               # “够近可抓”的面积阈值
 grab_area_max = 0.26           # “太近了、先后退”的面积阈值,须大于 grab_area
-grab_left_turn_count = 2       # 抓取前左转微调次数(补偿爪子偏心)
-grab_left_turn_speed = 35      # 左转微调速度(与 grab_left_turn_ms 成对标定)
+grab_turn_count = 2            # 抓取前盲转微调次数(补偿爪子偏心)
+grab_turn_speed = 35           # 盲转微调速度(与 grab_turn_ms 成对标定)
+grab_turn_direction = "right"  # 盲转方向:left 左转 / right 右转,按爪子相对相机的偏心方向选(逐车不同)
 grab_confirm_threshold = 5     # 连续满足“够近且居中”的确认帧数
 lost_grace_frames = 8          # 丢失宽限帧数,超过才判定真丢
 grab_backoff_ms = 200          # 太近时后退时长
-grab_left_turn_ms = 250        # 每次左转微调时长
-grab_turn_gap_ms = 100         # 两次左转之间的停稳间隔
+grab_turn_ms = 250             # 每次盲转微调时长
+grab_turn_gap_ms = 100         # 两次盲转之间的停稳间隔
 grab_close_ms = 200            # 闭爪后等待伺服到位
 grab_release_ms = 100          # 松开后等待伺服到位
 grab_home_ms = 100             # 归位后回到追球前的等待
@@ -52,12 +53,12 @@ id2_angle_close = 40.0   # 舵机2(爪)闭合角度
 angle_max = 270.0        # 舵机全量程角度(角度→脉宽映射)
 pulse_min = 500          # 脉宽下限(对应 0°)
 pulse_max = 2500         # 脉宽上限(对应 angle_max)
-servo0_ready = 150.0     # 舵机0 待抓/归位
-servo1_ready = 85.0     # 舵机1 待抓/归位
-servo0_grab = 245.0      # 舵机0 伸到最低(抓取)
-servo1_grab = 85.0      # 舵机1 伸到最低(抓取)
-servo0_lift = 150.0      # 舵机0 抬起(持球)
-servo1_lift = 85.0      # 舵机1 抬起(持球)
+servo0_ready = 120.0     # 舵机0 待抓/归位
+servo1_ready = 185.0     # 舵机1 待抓/归位
+servo0_grab = 25.0      # 舵机0 伸到最低(抓取)
+servo1_grab = 185.0      # 舵机1 伸到最低(抓取)
+servo0_lift = 120.0      # 舵机0 抬起(持球)
+servo1_lift = 185.0      # 舵机1 抬起(持球)
 grab_move_time_ms = 1000              # 每条 set_angle 指令的运动时长
 grab_settle_pre_close_ms = 1500       # 伸到最低、张爪后的等待
 grab_settle_close_ms = 1000           # 闭爪后的等待
@@ -65,7 +66,7 @@ grab_settle_lift_ms = 1200            # 抬起后的等待
 
 # ── 电机映射:PWM 缩放与死区下限(ppr/pwm_freq 随 CMD_CONFIG 下发) ──
 [motor]
-speed_scale = 55      # PWM 满量程缩放(百分比)
+speed_scale = 65      # PWM 满量程缩放(百分比)
 min_speed = 20        # 死区映射的速度下限
 ppr = 4680            # 编码器每转脉冲数
 pwm_freq = 20000      # PWM 频率

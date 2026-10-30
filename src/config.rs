@@ -19,10 +19,10 @@ use crate::robot::{
     BACKWARD_SPEED, BRAKE_TRAVEL_MARGIN, CENTER_MARGIN, CHASE_FAR_AREA, CHASE_MID_AREA,
     CHASE_SPEED_FAR, CHASE_SPEED_MID, CHASE_SPEED_NEAR, CORRECT_SETTLE_MS, GRAB_AREA,
     GRAB_AREA_MAX, GRAB_BACKOFF_MS, GRAB_CLOSE_MS, GRAB_CONFIRM_THRESHOLD, GRAB_HOME_MS,
-    GRAB_LEFT_TURN_COUNT, GRAB_LEFT_TURN_MS, GRAB_LEFT_TURN_SPEED, GRAB_RELEASE_MS,
-    GRAB_TURN_GAP_MS, IDLE_SPEED, LANE_BREAK_PX, LOST_GRACE_FRAMES, MARGIN_PROXIMITY_GAIN,
-    PROXIMITY_DAMP_MIN, REFERENCE_FRAME_WIDTH, TURN_INPLACE_AREA, TURN_PULSE_GAIN_MS,
-    TURN_PULSE_MAX_MS, TURN_PULSE_MIN_MS, TURN_PULSE_SPEED, TURN_PULSE_SPEED_DIFF,
+    GRAB_RELEASE_MS, GRAB_TURN_COUNT, GRAB_TURN_GAP_MS, GRAB_TURN_MS, GRAB_TURN_SPEED, IDLE_SPEED,
+    LANE_BREAK_PX, LOST_GRACE_FRAMES, MARGIN_PROXIMITY_GAIN, PROXIMITY_DAMP_MIN,
+    REFERENCE_FRAME_WIDTH, TURN_INPLACE_AREA, TURN_PULSE_GAIN_MS, TURN_PULSE_MAX_MS,
+    TURN_PULSE_MIN_MS, TURN_PULSE_SPEED, TURN_PULSE_SPEED_DIFF,
 };
 use serde::Deserialize;
 use std::path::Path;
@@ -74,8 +74,9 @@ pub struct ChassisConfig {
     pub backward_speed: i32,
     /// 全局转向极性:轮子通道与物理左右反接的底盘置 true。
     ///
-    /// 一个开关同时翻转“追球修正 / 丢球搜索 / 抓取盲转”三条路的左右方向,
-    /// 让同一种接线补偿一致生效;正常接线保持 false。
+    /// 一个开关同时翻转“追球修正 / 丢球搜索”两条闭环路的左右方向(接线反接补偿),
+    /// 让同一种补偿一致生效;正常接线保持 false。抓取盲转方向由
+    /// `[grab] grab_turn_direction` 单独指定,不随本开关走。
     pub turn_reverse: bool,
 }
 
@@ -107,6 +108,18 @@ impl Default for ChassisConfig {
     }
 }
 
+/// 抓取盲转阶段的转向。机械臂/爪子相对相机的偏心方向随装配而变,不同小车需要
+/// 不同的方向,故做成显式的 left/right,而不是跟着底盘接线极性走。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GrabTurnDirection {
+    /// 盲转阶段左转(左轮回退、右轮前进)。
+    #[default]
+    Left,
+    /// 盲转阶段右转(左轮前进、右轮回退)。
+    Right,
+}
+
 /// 抓取状态机各段的阈值与时长。
 #[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
 #[serde(default)]
@@ -115,19 +128,21 @@ pub struct GrabConfig {
     pub grab_area: f32,
     /// “太近了、先后退”的面积阈值,须大于 grab_area。
     pub grab_area_max: f32,
-    /// 抓取前左转微调的次数(补偿爪子偏心)。
-    pub grab_left_turn_count: i32,
-    /// 抓取前左转微调的速度。
-    pub grab_left_turn_speed: i32,
+    /// 抓取前盲转微调的次数(补偿爪子偏心)。
+    pub grab_turn_count: i32,
+    /// 抓取前盲转微调的速度。
+    pub grab_turn_speed: i32,
+    /// 抓取前盲转微调的转向:left 左转、right 右转,按爪子相对相机的偏心方向选。
+    pub grab_turn_direction: GrabTurnDirection,
     /// 连续满足“够近且居中”的确认帧数,防单帧误检。
     pub grab_confirm_threshold: i32,
     /// 丢失宽限帧数,超过才判定真丢并开始搜索。
     pub lost_grace_frames: i32,
     /// 太近时后退的时长。
     pub grab_backoff_ms: u64,
-    /// 每次左转微调的时长。
-    pub grab_left_turn_ms: u64,
-    /// 两次左转之间的停稳间隔。
+    /// 每次盲转微调的时长。
+    pub grab_turn_ms: u64,
+    /// 两次盲转之间的停稳间隔。
     pub grab_turn_gap_ms: u64,
     /// 爪子闭合后等待伺服到位的时长。
     pub grab_close_ms: u64,
@@ -142,12 +157,13 @@ impl Default for GrabConfig {
         Self {
             grab_area: GRAB_AREA,
             grab_area_max: GRAB_AREA_MAX,
-            grab_left_turn_count: GRAB_LEFT_TURN_COUNT,
-            grab_left_turn_speed: GRAB_LEFT_TURN_SPEED,
+            grab_turn_count: GRAB_TURN_COUNT,
+            grab_turn_speed: GRAB_TURN_SPEED,
+            grab_turn_direction: GrabTurnDirection::default(),
             grab_confirm_threshold: GRAB_CONFIRM_THRESHOLD,
             lost_grace_frames: LOST_GRACE_FRAMES,
             grab_backoff_ms: GRAB_BACKOFF_MS,
-            grab_left_turn_ms: GRAB_LEFT_TURN_MS,
+            grab_turn_ms: GRAB_TURN_MS,
             grab_turn_gap_ms: GRAB_TURN_GAP_MS,
             grab_close_ms: GRAB_CLOSE_MS,
             grab_release_ms: GRAB_RELEASE_MS,
@@ -306,7 +322,7 @@ pub fn load(path: &Path) -> Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, get};
+    use super::{Config, GrabTurnDirection, get};
 
     /// 缺省字段回退到内置默认,给出的字段生效。
     #[test]
@@ -330,5 +346,16 @@ turn_pulse_speed = 33
     #[test]
     fn get_returns_default_before_init() {
         assert_eq!(get(), Config::default());
+    }
+
+    /// grab_turn_direction 接受 "left"/"right",缺省回退到 Left。
+    #[test]
+    fn grab_turn_direction_parses_and_defaults() {
+        let cfg: Config = toml::from_str("[grab]\ngrab_turn_direction = \"right\"\n").unwrap();
+        assert_eq!(cfg.grab.grab_turn_direction, GrabTurnDirection::Right);
+        assert_eq!(
+            Config::default().grab.grab_turn_direction,
+            GrabTurnDirection::Left
+        );
     }
 }
