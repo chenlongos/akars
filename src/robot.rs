@@ -496,15 +496,18 @@ fn handle_detections(
             );
             motor.standby();
         } else {
-            // 真丢了:朝球最后出现的一侧转,而不是固定方向盲搜。
+            // 真丢了:朝球最后出现的一侧转,而不是固定方向盲搜。极性与追球
+            // 共用 `[chassis] turn_reverse`,保证通道反接的底盘仍朝正确一侧搜索。
             robot.status = RobotStatus::ChaseTennis;
             let last_offset = robot.ball_cx - image_w / 2;
+            let polarity = if cfg.chassis.turn_reverse { -1 } else { 1 };
+            let s = cfg.chassis.idle_speed * polarity;
             if last_offset >= 0 {
                 eprintln!("[detect] ball lost, searching right (last seen right)");
-                motor.drive(cfg.chassis.idle_speed, -cfg.chassis.idle_speed);
+                motor.drive(s, -s);
             } else {
                 eprintln!("[detect] ball lost, searching left (last seen left)");
-                motor.drive(-cfg.chassis.idle_speed, cfg.chassis.idle_speed);
+                motor.drive(-s, s);
             }
         }
         return None;
@@ -579,8 +582,14 @@ fn servo_step(
     let forward = approach_speed(area_ratio);
     // 脉冲的前进分量:远处边走边修,近了归零 → 两轮等幅反向,原地转。
     let bias = turn_forward_bias(forward, area_ratio);
+    // 全局转向极性:`[chassis] turn_reverse` 置 true 时镜像左右,与追球/搜索/抓取共用。
+    let polarity = if config::get().chassis.turn_reverse {
+        -1
+    } else {
+        1
+    };
     let turn = match robot.steer_phase {
-        SteerPhase::Correcting { dir, .. } => turn_amplitude(area_ratio) * dir,
+        SteerPhase::Correcting { dir, .. } => steer_turn(dir, turn_amplitude(area_ratio), polarity),
         SteerPhase::Straight | SteerPhase::Settling { .. } => 0,
     };
 
@@ -607,6 +616,13 @@ fn servo_step(
     // 远处保留前进分量:两轮同向滚动,不会因为"原地转那点力矩过不了静摩擦"而卡住;
     // 近处(bias = 0)等幅反向 = 原地转,转完由直线段负责往前靠。
     motor.drive(bias + turn, bias - turn);
+}
+
+/// 把名义转向 `dir`(±1)与全局极性 `polarity`(±1)合成轮用的转向量。
+/// `polarity` 来自 `[chassis] turn_reverse`:通道与物理左右反接的底盘用它把
+/// 追球 / 搜索 / 抓取三条路一起翻回正确方向(见 servo_step / handle_detections / advance_grab)。
+fn steer_turn(dir: i32, amplitude: i32, polarity: i32) -> i32 {
+    dir * amplitude * polarity
 }
 
 /// 修正脉冲里保留多少前进分量:远处给全量(边走边修的差速),近处归零(原地转)。
@@ -802,7 +818,7 @@ fn advance_grab(robot: &mut RobotState, motor: &mut Motor, arm: &mut Arm) {
         GrabPhase::LeftTurn { until, remaining } => {
             if now < until {
                 let (l, r) =
-                    grab_turn_wheels(cfg.grab.grab_left_turn_speed, cfg.grab.grab_turn_reverse);
+                    grab_turn_wheels(cfg.grab.grab_left_turn_speed, cfg.chassis.turn_reverse);
                 motor.drive(l, r);
                 return;
             }
@@ -867,7 +883,7 @@ fn advance_grab(robot: &mut RobotState, motor: &mut Motor, arm: &mut Arm) {
 }
 
 /// 抓取微调时左右轮的目标转速:`reverse` 为假时左转(前-后/后-前),
-/// 为真时镜像成右转。把方向定义从调用点抽出来,便于单测验证两种极性和。
+/// 为真时镜像成右转。`reverse` 传入 `[chassis] turn_reverse`,与追球/搜索共用同一极性开关。
 fn grab_turn_wheels(speed: i32, reverse: bool) -> (i32, i32) {
     if reverse {
         (speed, -speed)
@@ -901,7 +917,7 @@ mod tests {
         TURN_PULSE_GAIN_MS, TURN_PULSE_MAX_MS, TURN_PULSE_MIN_MS, TURN_PULSE_SPEED,
         TURN_PULSE_SPEED_DIFF, advance_grab, advance_steer_phase, approach_speed, brake_scale,
         finish_grab, grab_turn_wheels, proximity_center_margin, pulse_ms, scaled_center_margin,
-        scaled_px, turn_amplitude, turn_forward_bias,
+        scaled_px, steer_turn, turn_amplitude, turn_forward_bias,
     };
     use crate::arm::Arm;
     use crate::motor::Motor;
@@ -1227,9 +1243,9 @@ mod tests {
         assert!(CHASE_SPEED_NEAR >= 20);
     }
 
-    /// grab_turn_reverse 把抓取微调的两轮目标镜像,从而切换左/右转。
+    /// `[chassis] turn_reverse`(经 `grab_turn_wheels` 的 `reverse`)把抓取微调的两轮目标镜像。
     #[test]
-    fn grab_turn_reverse_mirrors_wheels() {
+    fn grab_turn_wheels_mirrors_wheels() {
         // 默认(不翻转):左轮回退、右轮前进 = 左转。
         assert_eq!(grab_turn_wheels(18, false), (-18, 18));
         // 翻转后:左右互换 = 右转。
@@ -1238,5 +1254,19 @@ mod tests {
         let (l, r) = grab_turn_wheels(18, false);
         let (rl, rr) = grab_turn_wheels(18, true);
         assert_eq!((rl, rr), (r, l));
+    }
+
+    /// 同一个 `turn_reverse` 开关同时驱动追球转向与抓取盲转的极性镜像。
+    #[test]
+    fn turn_reverse_shares_one_polarity_across_paths() {
+        // 追球:球在左 (dir=-1)。默认极性不翻转 → 名义左转。
+        assert_eq!(steer_turn(-1, TURN_PULSE_SPEED, 1), -TURN_PULSE_SPEED);
+        // 通道反接 (polarity=-1) → 转向量镜像,经反接接线后物理仍朝球一侧。
+        assert_eq!(steer_turn(-1, TURN_PULSE_SPEED, -1), TURN_PULSE_SPEED);
+        // 幅值与极性无关,只改方向。
+        assert_eq!(steer_turn(1, 12, -1).abs(), 12);
+        // 抓取盲转读同一个 bool:true 时两轮镜像(与旧的 grab_turn_reverse=true 等价)。
+        assert_eq!(grab_turn_wheels(18, true), (18, -18));
+        assert_eq!(grab_turn_wheels(18, false), (-18, 18));
     }
 }

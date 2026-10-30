@@ -28,6 +28,7 @@ chase_speed_mid = 25         # 中处接近速度
 chase_speed_near = 20         # 近处接近速度(不低于实测能推动整车的下限)
 idle_speed = 25               # 丢球后原地慢转搜索速度
 backward_speed = 30           # 太近时的后退速度
+turn_reverse = true           # 全局转向极性:轮子通道与物理左右反接时置 true,同时纠正追球/搜索/抓取(正常接线用 false)
 
 # ── 抓取状态机:距离阈值、确认帧数、各段时长 ──
 [grab]
@@ -35,7 +36,6 @@ grab_area = 0.25               # “够近可抓”的面积阈值
 grab_area_max = 0.26           # “太近了、先后退”的面积阈值,须大于 grab_area
 grab_left_turn_count = 2       # 抓取前左转微调次数(补偿爪子偏心)
 grab_left_turn_speed = 35      # 左转微调速度(与 grab_left_turn_ms 成对标定)
-grab_turn_reverse = true
 grab_confirm_threshold = 5     # 连续满足“够近且居中”的确认帧数
 lost_grace_frames = 8          # 丢失宽限帧数,超过才判定真丢
 grab_backoff_ms = 200          # 太近时后退时长

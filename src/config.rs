@@ -72,6 +72,11 @@ pub struct ChassisConfig {
     pub idle_speed: i32,
     /// 太近时的后退速度。
     pub backward_speed: i32,
+    /// 全局转向极性:轮子通道与物理左右反接的底盘置 true。
+    ///
+    /// 一个开关同时翻转“追球修正 / 丢球搜索 / 抓取盲转”三条路的左右方向,
+    /// 让同一种接线补偿一致生效;正常接线保持 false。
+    pub turn_reverse: bool,
 }
 
 impl Default for ChassisConfig {
@@ -97,6 +102,7 @@ impl Default for ChassisConfig {
             chase_speed_near: CHASE_SPEED_NEAR,
             idle_speed: IDLE_SPEED,
             backward_speed: BACKWARD_SPEED,
+            turn_reverse: false,
         }
     }
 }
@@ -113,11 +119,6 @@ pub struct GrabConfig {
     pub grab_left_turn_count: i32,
     /// 抓取前左转微调的速度。
     pub grab_left_turn_speed: i32,
-    /// 翻转抓取微调的转向:默认 false 为左转,置 true 改为右转。
-    ///
-    /// 爪子相对相机的偏心方向随装配而变;换车后若发现该左却右,
-    /// 把这个置 true 即可,不用改代码重编译。
-    pub grab_turn_reverse: bool,
     /// 连续满足“够近且居中”的确认帧数,防单帧误检。
     pub grab_confirm_threshold: i32,
     /// 丢失宽限帧数,超过才判定真丢并开始搜索。
@@ -143,7 +144,6 @@ impl Default for GrabConfig {
             grab_area_max: GRAB_AREA_MAX,
             grab_left_turn_count: GRAB_LEFT_TURN_COUNT,
             grab_left_turn_speed: GRAB_LEFT_TURN_SPEED,
-            grab_turn_reverse: false,
             grab_confirm_threshold: GRAB_CONFIRM_THRESHOLD,
             lost_grace_frames: LOST_GRACE_FRAMES,
             grab_backoff_ms: GRAB_BACKOFF_MS,
