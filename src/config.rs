@@ -74,9 +74,9 @@ pub struct ChassisConfig {
     pub backward_speed: i32,
     /// 全局转向极性:轮子通道与物理左右反接的底盘置 true。
     ///
-    /// 一个开关同时翻转“追球修正 / 丢球搜索”两条闭环路的左右方向(接线反接补偿),
-    /// 让同一种补偿一致生效;正常接线保持 false。抓取盲转方向由
-    /// `[grab] grab_turn_direction` 单独指定,不随本开关走。
+    /// 一个开关同时翻转所有闭环差的左右方向:追球修正、丢球搜索、追桶趋近、
+    /// 找桶旋转(接线反接补偿),让同一种补偿一致生效;正常接线保持 false。
+    /// 抓取盲转方向由 `[grab] grab_turn_direction` 单独指定,不随本开关走。
     pub turn_reverse: bool,
 }
 
@@ -150,6 +150,8 @@ pub struct GrabConfig {
     pub grab_release_ms: u64,
     /// 爪子归位后回到追球前的等待时长。
     pub grab_home_ms: u64,
+    /// 抓到球后是否进入“追蓝桶 → 放球”循环;false 退回旧行为(抓完原地松爪再追球)。
+    pub chase_bucket: bool,
 }
 
 impl Default for GrabConfig {
@@ -168,6 +170,7 @@ impl Default for GrabConfig {
             grab_close_ms: GRAB_CLOSE_MS,
             grab_release_ms: GRAB_RELEASE_MS,
             grab_home_ms: GRAB_HOME_MS,
+            chase_bucket: true,
         }
     }
 }
@@ -346,6 +349,14 @@ turn_pulse_speed = 33
     #[test]
     fn get_returns_default_before_init() {
         assert_eq!(get(), Config::default());
+    }
+
+    /// chase_bucket 缺省为开,TOML 显式写 false 才关掉追桶放桶循环。
+    #[test]
+    fn chase_bucket_parses_and_defaults() {
+        assert!(Config::default().grab.chase_bucket);
+        let cfg: Config = toml::from_str("[grab]\nchase_bucket = false\n").unwrap();
+        assert!(!cfg.grab.chase_bucket);
     }
 
     /// grab_turn_direction 接受 "left"/"right",缺省回退到 Left。

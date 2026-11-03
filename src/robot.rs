@@ -1,7 +1,5 @@
 use crate::arm::Arm;
-// [桶流程已停用] 现在不需要找桶。要恢复:取消下面这行注释,并把本文件里所有
-// 标了 `[桶流程已停用]` 的段落一起取消注释。`src/bucket.rs` 本身没有改动。
-// use crate::bucket::{self, BucketOutcome};
+use crate::bucket::{self, BucketOutcome};
 use crate::camera::UsbCamera;
 use crate::config;
 use crate::detector::Detection;
@@ -90,8 +88,8 @@ struct RobotState {
     steer_phase: SteerPhase,
     // 抓取状态机当前阶段。
     grab_phase: GrabPhase,
-    // [桶流程已停用] 找桶/放球流程。
-    // bucket: bucket::BucketTrack,
+    // 「抓起来 → 追蓝桶 → 放进桶」流程的状态机。
+    bucket: bucket::BucketTrack,
 }
 
 impl Default for RobotState {
@@ -104,8 +102,7 @@ impl Default for RobotState {
             miss_count: 0,
             steer_phase: SteerPhase::Straight,
             grab_phase: GrabPhase::Idle,
-            // [桶流程已停用]
-            // bucket: bucket::BucketTrack::default(),
+            bucket: bucket::BucketTrack::default(),
         }
     }
 }
@@ -280,11 +277,7 @@ pub fn run_tennis_hunter(
     while !stop_requested() {
         frame_idx += 1;
 
-        // ── [桶流程已停用] 现在不需要找桶。
-        //
-        // 原来这里独占一帧跑桶色检测(不推理),由 robot.bucket.is_active() 触发。
-        // 要恢复:取消下面整块注释,并恢复文件末尾 bucket_enabled() 的默认开启。
-        /*
+        // ── 桶流程进行中:独占一帧跑桶色检测(不推理),由 robot.bucket.is_active() 触发。
         if robot.bucket.is_active() {
             let bucket_start = Instant::now();
             let frame = match camera.get_frame() {
@@ -344,7 +337,6 @@ pub fn run_tennis_hunter(
             }
             continue;
         }
-        */
 
         // ── 取帧:内核 ioctl 4 返回 YUV422 planar(I422),用户态转换后喂张量。
         let capture_start = Instant::now();
@@ -478,7 +470,7 @@ fn handle_detections(
 ) -> Option<i32> {
     // 抓取序列进行中:主循环照常取帧/推理/打日志,这里只按时间戳推进各阶段。
     if !matches!(robot.grab_phase, GrabPhase::Idle) {
-        advance_grab(robot, motor, arm);
+        advance_grab(robot, motor, arm, bucket_enabled());
         return None;
     }
 
@@ -583,7 +575,7 @@ fn servo_step(
     let forward = approach_speed(area_ratio);
     // 脉冲的前进分量:远处边走边修,近了归零 → 两轮等幅反向,原地转。
     let bias = turn_forward_bias(forward, area_ratio);
-    // 全局转向极性:`[chassis] turn_reverse` 置 true 时镜像左右,追球与搜索共用。
+    // 全局转向极性:`[chassis] turn_reverse` 置 true 时镜像左右,追球/搜索/追桶共用。
     let polarity = if config::get().chassis.turn_reverse {
         -1
     } else {
@@ -652,17 +644,12 @@ fn servo_log() -> bool {
     std::env::var("AKARS_SERVO_LOG").is_ok()
 }
 
-// [桶流程已停用] 原来这里的功能开关:「抓起来 → 找红桶 → 放进去」,**默认开**
-// (只有设了 AKARS_NO_BUCKET 才关)。现在不需要找桶,调用点已全部去掉。
-// 要恢复找桶:取消下面的注释,并把 handle_detections 里 advance_grab 的调用、
-// finish_grab/advance_grab 的签名一并改回来。
-//
-// /// 功能开关:「抓起来 → 找红桶 → 放进去」流程,**默认开**。
-// ///
-// /// 设 `AKARS_NO_BUCKET` 退回旧行为(抓完原地松爪)。
-// fn bucket_enabled() -> bool {
-//     std::env::var("AKARS_NO_BUCKET").is_err()
-// }
+/// 功能开关：「抓起来 → 追蓝桶 → 放进桶」流程，由配置文件
+/// `[grab] chase_bucket` 决定（缺省开）；临时调试还可用 `AKARS_NO_BUCKET`
+/// 环境变量强制关掉，不必改卡上的配置。
+fn bucket_enabled() -> bool {
+    config::get().grab.chase_bucket && std::env::var("AKARS_NO_BUCKET").is_err()
+}
 
 /// 推进转向阶段。
 fn advance_steer_phase(
@@ -780,17 +767,25 @@ fn start_grab(robot: &mut RobotState, area_ratio: f32) {
     }
 }
 
-/// 抓取序列走完最后一格之后的去向:回初始位置 → 放开 → 继续追球。
+/// 抓取序列走完最后一格之后的去向。
+///
+/// `bucket_mode` 为真:球已在手上,不进放开的三段收尾,而是直接转入
+/// “追蓝桶 → 放进桶”流程(`robot.bucket.start()`),由主循环的 `bucket.is_active()`
+/// 分支接管。为假(旧行为):回初始位置 → 原地松爪 → 继续追球。
 ///
 /// 单独抽出来是因为 `arm.grab()` 阻塞约 3.7s(`arm.rs:61-72`),想验证这一段就得绕开它。
-fn finish_grab(robot: &mut RobotState, now: Instant) {
-    // [桶流程已停用] 原来这里是与桶流程唯一的分岔点:
-    //   if bucket_mode {
-    //       eprintln!("[bucket] ball held -> searching for bucket");
-    //       robot.grab_phase = GrabPhase::Idle;
-    //       robot.bucket.start();   // 不松爪,夹着球去找桶
-    //   }
-    // 现在不再找桶,统一走原地放开。
+fn finish_grab(robot: &mut RobotState, now: Instant, bucket_mode: bool) {
+    if bucket_mode {
+        // 与桶流程唯一的分岔点:不松爪,夹着球去找桶。
+        eprintln!("[bucket] ball held -> searching for bucket");
+        robot.grab_phase = GrabPhase::Idle;
+        robot.status = RobotStatus::ChaseTennis;
+        robot.grab_confirm_count = 0;
+        robot.miss_count = 0;
+        robot.steer_phase = SteerPhase::Straight;
+        robot.bucket.start();
+        return;
+    }
     robot.grab_phase = GrabPhase::Closing {
         until: now + Duration::from_millis(config::get().grab.grab_close_ms),
     };
@@ -798,7 +793,9 @@ fn finish_grab(robot: &mut RobotState, now: Instant) {
 
 /// 推进抓取状态机:每段只在进入时发一次指令,到期后切换下一段。
 /// 底盘指令按帧重发(ESP32 锁存目标转速,重发只是保险,不会叠加)。
-fn advance_grab(robot: &mut RobotState, motor: &mut Motor, arm: &mut Arm) {
+///
+/// `bucket_mode` 决定抓完这一格球后的去向:真 → 转入追桶/放桶;假 → 原地松爪回追球。
+fn advance_grab(robot: &mut RobotState, motor: &mut Motor, arm: &mut Arm, bucket_mode: bool) {
     let now = Instant::now();
     let cfg = config::get();
 
@@ -843,7 +840,7 @@ fn advance_grab(robot: &mut RobotState, motor: &mut Motor, arm: &mut Arm) {
             } else {
                 // arm.grab() 阻塞约 3.7s,结束时夹爪闭合、机械臂停在 LIFT 位 —— 球在手上。
                 arm.grab();
-                finish_grab(robot, now);
+                finish_grab(robot, now, bucket_mode);
             }
         }
 
@@ -1162,10 +1159,20 @@ mod tests {
     fn grab_tail_goes_home_then_releases() {
         let mut robot = RobotState::default();
         let now = Instant::now();
-        finish_grab(&mut robot, now);
+        finish_grab(&mut robot, now, false);
 
         // 不松爪、也不停在 Idle:先走归位/放开的三段。
         assert!(matches!(robot.grab_phase, GrabPhase::Closing { .. }));
+    }
+
+    /// 桶流程开启时,抓完最后一格不原地松爪:球保持在手上,直接交接给追桶状态机。
+    #[test]
+    fn finish_grab_hands_off_to_bucket_when_enabled() {
+        let mut robot = RobotState::default();
+        finish_grab(&mut robot, Instant::now(), true);
+        // 不进 Closing/Releasing:抓取状态机复位,球夹着,交给桶流程。
+        assert!(matches!(robot.grab_phase, GrabPhase::Idle));
+        assert!(robot.bucket.is_active());
     }
 
     /// 收尾三段走完必须回到追球状态 —— 否则抓一次就停机,不再抓下一个球。
@@ -1183,19 +1190,19 @@ mod tests {
         robot.grab_phase = GrabPhase::Closing {
             until: Instant::now() - Duration::from_millis(1),
         };
-        advance_grab(&mut robot, &mut motor, &mut arm);
+        advance_grab(&mut robot, &mut motor, &mut arm, false);
         assert!(matches!(robot.grab_phase, GrabPhase::Releasing { .. }));
 
         robot.grab_phase = GrabPhase::Releasing {
             until: Instant::now() - Duration::from_millis(1),
         };
-        advance_grab(&mut robot, &mut motor, &mut arm);
+        advance_grab(&mut robot, &mut motor, &mut arm, false);
         assert!(matches!(robot.grab_phase, GrabPhase::Homing { .. }));
 
         robot.grab_phase = GrabPhase::Homing {
             until: Instant::now() - Duration::from_millis(1),
         };
-        advance_grab(&mut robot, &mut motor, &mut arm);
+        advance_grab(&mut robot, &mut motor, &mut arm, false);
 
         assert!(
             matches!(robot.grab_phase, GrabPhase::Idle),
@@ -1220,7 +1227,7 @@ mod tests {
             ..RobotState::default()
         };
         let (mut motor, mut arm) = (Motor::mock(), Arm::mock());
-        advance_grab(&mut robot, &mut motor, &mut arm);
+        advance_grab(&mut robot, &mut motor, &mut arm, false);
         assert!(matches!(
             robot.grab_phase,
             GrabPhase::Turn { remaining: 1, .. }
@@ -1259,10 +1266,10 @@ mod tests {
         assert_eq!((rl, rr), (r, l));
     }
 
-    /// `[chassis] turn_reverse` 只镜像追球/搜索的接线极性;抓取盲转方向独立,
-    /// 由 `[grab] grab_turn_direction` 决定,不受本开关影响。
+    /// `[chassis] turn_reverse` 镜像所有闭环差的接线极性(追球/搜索/追桶,
+    /// 见 `bucket.rs`);抓取盲转方向独立,由 `[grab] grab_turn_direction` 决定。
     #[test]
-    fn turn_reverse_mirrors_chase_and_search_only() {
+    fn turn_reverse_mirrors_closed_loops_not_blind_grab() {
         // 追球:球在左 (dir=-1)。默认极性不翻转 → 名义左转。
         assert_eq!(steer_turn(-1, TURN_PULSE_SPEED, 1), -TURN_PULSE_SPEED);
         // 通道反接 (polarity=-1) → 转向量镜像,经反接接线后物理仍朝球一侧。

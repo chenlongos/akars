@@ -109,11 +109,12 @@ restart the program — no rebuild needed.
   runs entirely on defaults.
 - Inference thresholds (`--conf` / `--iou` / `--classes`) and device paths stay
   on the command line; only the motion parameters above are externalized.
-- `[chassis] turn_reverse = true` mirrors the left/right steering polarity for the
-  two closed-loop paths — the chase correction and the lost-ball search turn. It is
+- `[chassis] turn_reverse = true` mirrors the left/right steering polarity for every
+  closed-loop differential on the chassis — the chase correction, the lost-ball
+  search turn, the bucket-approach proportional steer and the bucket search spin. It is
   meant for boards whose two motor channels are wired to the opposite sides (a
   "left" command physically turns right). Chasing is normally closed-loop (it
-  corrects toward the ball) but still inherits the mirror so both paths stay
+  corrects toward the ball) but still inherits the mirror so all paths stay
   consistent. Use `false` for a normally wired car instead of rebuilding.
 - `[grab] grab_turn_direction = "left" | "right"` sets the open-loop pre-grab turn
   side on its own, independent of `turn_reverse`. Because the claw sits off-center
@@ -121,6 +122,11 @@ restart the program — no rebuild needed.
   cars need to turn toward different sides to bring the ball in front of the claw,
   so this is an explicit per-car calibration value rather than something derived from
   the wiring polarity.
+- `[grab] chase_bucket = true | false` decides whether a successful grab hands over
+  to the "chase the blue bucket -> deposit the ball" loop (`true`, the default) or
+  the claw just releases in place and the car chases the next ball (`false`).
+  For quick on-car debugging the `AKARS_NO_BUCKET` environment variable force-
+  disables the bucket loop without editing the config file.
 
 Test TPU inference on a single image:
 

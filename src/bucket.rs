@@ -13,13 +13,16 @@
 //!   3. 趋近用**独立的连续比例差速**，不接 `robot.rs` 的 `servo_step` —— 参考就是连续
 //!      比例；我们的球道因为连续修正会摆头才改成脉冲+静置（见 `robot.rs:98-128`）。
 //!      桶是静止大目标、末端还有 350ms 硬刹托底，所以这里回归连续控制，且完全隔离在
-//!      本模块内，不会渗进追球逻辑。
+//!      本模块内，不会渗进追球逻辑。但接线极性补偿是共享的：左右方向同样过
+//!      `[chassis] turn_reverse`，和追球/丢球搜索/找桶旋转同源，不然轮子通道反接的
+//!      底盘在追桶时会左右反向。
 //!   4. 舵机角度不搬（两边标定不同），只搬时序。
 //!   5. **颜色不同**：参考写死红色，我们用蓝色。颜色只由 `BUCKET_HUE_MIN/MAX` 和
 //!      `chroma_excludes_target` 这一对决定，其余代码颜色无关、换色不用改。
 
 use crate::arm::Arm;
 use crate::camera::PlanarFormat;
+use crate::config;
 use crate::motor::Motor;
 use std::time::{Duration, Instant};
 
@@ -77,6 +80,16 @@ pub const BUCKET_MIN_AREA_FULLRES: i32 = 1000;
 /// 调参开关：AKARS_BUCKET_LOG=1 时每帧打印桶状态机的决策（默认关）。
 fn bucket_log() -> bool {
     std::env::var("AKARS_BUCKET_LOG").is_ok()
+}
+
+/// 全局转向极性：`[chassis] turn_reverse` 置 true 时镜像左右，与追球修正/
+/// 丢球搜索共用同一份接线补偿。抓取盲转不吃本开关（看 `grab_turn_direction`）。
+fn turn_polarity() -> i32 {
+    if config::get().chassis.turn_reverse {
+        -1
+    } else {
+        1
+    }
 }
 
 // ── 检测器 ────────────────────────────────────────────────────────────────
@@ -485,8 +498,10 @@ fn uf_find(parent: &mut [i32], mut x: usize) -> usize {
 // ── 趋近控制 ──────────────────────────────────────────────────────────────
 
 /// 趋近桶时的两轮速度。照搬参考 `tennis.cpp:424-434`：比例转向 + 中心死区 +
-/// 两级速度。`cx` 与 `half_w` 都在全分辨率坐标系里。
-fn bucket_approach_command(area_ratio: f32, cx: i32, half_w: i32) -> (i32, i32) {
+/// 两级速度。`cx` 与 `half_w` 都在全分辨率坐标系里。`polarity` 来自
+/// `[chassis] turn_reverse`：轮子通道与物理左右反接的底盘用它把差速镜像，
+/// 使修正朝物理上正确的一侧；死区/幅值/速度档与极性无关。
+fn bucket_approach_command(area_ratio: f32, cx: i32, half_w: i32, polarity: i32) -> (i32, i32) {
     let half_w = half_w.max(1);
     let off = cx - half_w;
     let bias = if off.abs() <= BUCKET_CENTER_DEAD_ZONE {
@@ -494,7 +509,7 @@ fn bucket_approach_command(area_ratio: f32, cx: i32, half_w: i32) -> (i32, i32) 
     } else {
         (BUCKET_K_TURN * off as f32 / half_w as f32) as i32
     };
-    let bias = bias.clamp(-BUCKET_MAX_BIAS, BUCKET_MAX_BIAS);
+    let bias = bias.clamp(-BUCKET_MAX_BIAS, BUCKET_MAX_BIAS) * polarity;
     let spd = if area_ratio >= BUCKET_AREA_BRAKE {
         BUCKET_BRAKE_SPD
     } else {
@@ -674,7 +689,9 @@ impl BucketTrack {
                         self.confirm = 0;
                         self.lost += 1;
                         // 参考固定右转；不按"最后看到的一侧"回摆，因为桶可能从未出现过。
-                        motor.drive(BUCKET_SEARCH_SPD, -BUCKET_SEARCH_SPD);
+                        // 轮速过极性镜像后，日志里的"右转"始终指物理右转，与丢球搜索一致。
+                        let p = turn_polarity();
+                        motor.drive(p * BUCKET_SEARCH_SPD, -p * BUCKET_SEARCH_SPD);
                         if bucket_log() {
                             eprintln!("[bucket] find: searching right, lost={}", self.lost);
                         }
@@ -716,7 +733,12 @@ impl BucketTrack {
                                 );
                             }
                         } else {
-                            let (l, rr) = bucket_approach_command(r.area_ratio, r.cx, width / 2);
+                            let (l, rr) = bucket_approach_command(
+                                r.area_ratio,
+                                r.cx,
+                                width / 2,
+                                turn_polarity(),
+                            );
                             motor.drive(l, rr);
                             if bucket_log() {
                                 eprintln!(
@@ -1102,38 +1124,56 @@ mod tests {
     fn approach_holds_a_dead_zone_and_clamps_the_bias() {
         let half = W / 2; // 320
         // 死区内不动舵:off = cx - 320
-        assert_eq!(bucket_approach_command(0.1, half, half), (25, 25));
-        assert_eq!(bucket_approach_command(0.1, half + 15, half), (25, 25));
+        assert_eq!(bucket_approach_command(0.1, half, half, 1), (25, 25));
+        assert_eq!(bucket_approach_command(0.1, half + 15, half, 1), (25, 25));
         // 出死区:比例转向
-        assert_eq!(bucket_approach_command(0.1, half + 16, half), (26, 24));
+        assert_eq!(bucket_approach_command(0.1, half + 16, half, 1), (26, 24));
         // 偏到底:bias 夹在 ±8
-        assert_eq!(bucket_approach_command(0.1, W, half), (33, 17));
-        assert_eq!(bucket_approach_command(0.1, 0, half), (17, 33));
+        assert_eq!(bucket_approach_command(0.1, W, half, 1), (33, 17));
+        assert_eq!(bucket_approach_command(0.1, 0, half, 1), (17, 33));
+    }
+
+    /// `[chassis] turn_reverse` 的极性只镜像差速修正，死区/幅值/速度档不变，
+    /// 与追球/丢球搜索共用同一份接线补偿。
+    #[test]
+    fn approach_mirrors_only_the_bias_with_turn_polarity() {
+        let half = W / 2; // 320
+        // 死区内：直行不受极性影响。
+        assert_eq!(bucket_approach_command(0.1, half + 15, half, -1), (25, 25));
+        // 出死区：两轮目标镜像，修正幅值不变。
+        assert_eq!(bucket_approach_command(0.1, half + 16, half, -1), (24, 26));
+        assert_eq!(bucket_approach_command(0.1, W, half, -1), (17, 33));
+        assert_eq!(bucket_approach_command(0.1, 0, half, -1), (33, 17));
+        // 制动区同样只镜像方向，不拆速度档。
+        assert_eq!(
+            bucket_approach_command(0.80, half + 160, half, -1),
+            (14, 30)
+        );
     }
 
     #[test]
     fn approach_creeps_once_in_the_brake_zone() {
         let half = W / 2;
-        assert_eq!(bucket_approach_command(0.69, half, half), (25, 25));
+        assert_eq!(bucket_approach_command(0.69, half, half, 1), (25, 25));
         assert_eq!(
-            bucket_approach_command(0.70, half, half),
+            bucket_approach_command(0.70, half, half, 1),
             (22, 22),
             "进入制动区降到蠕行档"
         );
-        assert_eq!(bucket_approach_command(0.90, half, half), (22, 22));
+        assert_eq!(bucket_approach_command(0.90, half, half, 1), (22, 22));
         // 制动区 + 大偏差:仍是一个向前的小弧,不是原地转。
         // (参考的 spd=5 在这里会让内轮反转成 13/-3 —— 而两轮都低于能动下限,
         //  整车根本不动,正是"靠近桶就站住"的成因。)
         // bias 在 off=160 就顶到 ±8 了(20×160/320 = 10 → 夹到 8)。
-        assert_eq!(bucket_approach_command(0.80, half + 100, half), (28, 16));
-        assert_eq!(bucket_approach_command(0.80, half + 160, half), (30, 14));
+        assert_eq!(bucket_approach_command(0.80, half + 100, half, 1), (28, 16));
+        assert_eq!(bucket_approach_command(0.80, half + 160, half, 1), (30, 14));
         assert_eq!(
-            bucket_approach_command(0.80, half + 160, half),
-            bucket_approach_command(0.80, W, half)
+            bucket_approach_command(0.80, half + 160, half, 1),
+            bucket_approach_command(0.80, W, half, 1)
         );
         // 关键不变量:制动力矩全给到偏差那一侧时,外侧轮仍在能动档以上 ——
         // 车会偏着走,但绝不死住。(内侧轮可能低于下限而拖住,那是允许的。)
-        let (l, r) = bucket_approach_command(0.80, half + 160, half);
+        let (l, r) = bucket_approach_command(0.80, half + 160, half, 1);
         assert!(
             l.max(r) >= MIN_MOVING_SPEED,
             "两轮都低于能动下限 = 整车死住"

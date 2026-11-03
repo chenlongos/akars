@@ -28,7 +28,7 @@ chase_speed_mid = 25         # 中处接近速度
 chase_speed_near = 20         # 近处接近速度(不低于实测能推动整车的下限)
 idle_speed = 25               # 丢球后原地慢转搜索速度
 backward_speed = 30           # 太近时的后退速度
-turn_reverse = false           # 全局转向极性:轮子通道与物理左右反接时置 true,同时纠正追球/搜索(正常接线用 false;抓取盲转方向看 grab_turn_direction)
+turn_reverse = false           # 全局转向极性:轮子通道与物理左右反接时置 true,同时纠正追球/搜索/追桶(正常接线用 false;抓取盲转方向看 grab_turn_direction)
 
 # ── 抓取状态机:距离阈值、确认帧数、各段时长 ──
 [grab]
@@ -45,6 +45,7 @@ grab_turn_gap_ms = 100         # 两次盲转之间的停稳间隔
 grab_close_ms = 200            # 闭爪后等待伺服到位
 grab_release_ms = 100          # 松开后等待伺服到位
 grab_home_ms = 100             # 归位后回到追球前的等待
+chase_bucket = true            # 抓到球后进入“追蓝桶→放球”循环;false 则抓完原地松爪再追下一个球
 
 # ── 机械臂:舵机姿势角度、脉宽标定、抓取动作时序 ──
 [arm]
