@@ -145,6 +145,24 @@ restart the program — no rebuild needed.
   the claw just releases in place and the car chases the next ball (`false`).
   For quick on-car debugging the `AKARS_NO_BUCKET` environment variable force-
   disables the bucket loop without editing the config file.
+- **A grab only counts if the claw actually closed on the ball.** After the full
+  grab sequence — including the lift — `arm.grab()` reads the claw position back
+  over the servo bus (ZP10S `#002PRAD!` -> `#002P1500!`) and compares it with the
+  close target: a held ball blocks the jaws, so the servo stalls clearly above
+  `[arm] id2_angle_close`; an empty close walks all the way to it. The read happens
+  **after the lift**, not right after closing: closing on the ball is not the same
+  as still holding it once the arm is up, and a ball that slips or gets shaken out
+  mid-lift lets the (still commanded) jaws close the rest of the way. That is also
+  the final holding state the bucket chase inherits. A **missed** grab never enters
+  the bucket/deposit stage — the claw reopens, the arm returns to the ready pose and
+  the car goes straight back to the chase -> grab loop, so a `chase_bucket = true`
+  car can no longer drive off hunting a bucket with an empty claw. Tune the
+  empty-close band with `[arm] grab_close_tolerance_deg` (degrees above the close
+  angle still counted as empty) on the logged `claw closed to N deg` line; set
+  `[arm] grab_verify = false` to skip the read entirely (or when the servo
+  firmware does not answer `PRAD`). With no reply the verdict degrades to
+  "unknown" and the old keep-going behavior is kept, so a car without position
+  feedback keeps working exactly as before.
 - The grab trigger compares an **EMA-filtered** ball area ratio (`[grab]
   area_filter_alpha`) against `grab_area` with a **hysteresis band** (`[grab]
   grab_hysteresis_frac`, a fraction of `grab_area`): jitter of the raw YOLO box

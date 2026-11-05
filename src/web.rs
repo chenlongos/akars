@@ -1,4 +1,4 @@
-use crate::arm::Arm;
+use crate::arm::{Arm, GrabVerdict};
 use crate::config::DEFAULT_CONFIG_PATH;
 use crate::motor::{Motor, MotorConfig};
 use axum::extract::{Query, State};
@@ -348,9 +348,18 @@ impl HardwareState {
         let action = request.action.trim();
         match action {
             "grab" => {
-                self.with_arm(|arm| arm.grab())?;
+                // grab() 会读回夹爪闭合角判定有没有夹到球,把这个判定回显到前端,
+                // 单机调爪子时不用翻日志就能看出这爪是不是空的。
+                let mut verdict = GrabVerdict::Unknown;
+                self.with_arm(|arm| verdict = arm.grab())?;
                 self.last_action = "arm grab".to_string();
-                Ok("arm grab".to_string())
+                Ok(match verdict {
+                    GrabVerdict::Held { pulse } => format!("arm grab: ball held (pulse {pulse})"),
+                    GrabVerdict::Missed { pulse } => {
+                        format!("arm grab: empty claw (pulse {pulse})")
+                    }
+                    GrabVerdict::Unknown => "arm grab".to_string(),
+                })
             }
             "release" => {
                 self.with_arm(|arm| arm.release())?;

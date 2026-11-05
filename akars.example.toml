@@ -52,6 +52,9 @@ grab_close_ms = 200            # 闭爪后等待伺服到位
 grab_release_ms = 100          # 松开后等待伺服到位
 grab_home_ms = 100             # 归位后回到追球前的等待
 chase_bucket = true            # 抓到球后进入“追蓝桶→放球”循环;false 则抓完原地松爪再追下一个球
+# 抓取是否成功不看流程走完,而看夹爪闭合角度:球顶住爪口时舵机走不到闭合角,
+# 读回角度会明显大于 [arm] id2_angle_close(容差 grab_close_tolerance_deg)。
+# 空合 → 开爪归位 → 直接回追球重走 追球→抓球,不进追桶/放球。
 
 # ── 机械臂:舵机姿势角度、脉宽标定、抓取动作时序 ──
 [arm]
@@ -66,6 +69,8 @@ servo0_grab = 25.0      # 舵机0 伸到最低(抓取)
 servo1_grab = 185.0      # 舵机1 伸到最低(抓取)
 servo0_lift = 120.0      # 舵机0 抬起(持球)
 servo1_lift = 185.0      # 舵机1 抬起(持球)
+grab_verify = true                    # 闭爪后读回夹角(PRAD 回包)判断是否真的夹到球;空合则回追球重抓,不进桶流程
+grab_close_tolerance_deg = 15.0       # 空合判定容差:读回角度 ≤ 闭合角+此值 视为没夹到(伺服回差/标定误差不算)
 grab_move_time_ms = 1000              # 每条 set_angle 指令的运动时长
 grab_settle_pre_close_ms = 1500       # 伸到最低、张爪后的等待
 grab_settle_close_ms = 1000           # 闭爪后的等待

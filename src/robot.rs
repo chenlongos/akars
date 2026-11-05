@@ -1,4 +1,4 @@
-use crate::arm::Arm;
+use crate::arm::{Arm, GrabVerdict};
 use crate::bucket::{self, BucketOutcome};
 use crate::camera::UsbCamera;
 use crate::config;
@@ -936,12 +936,26 @@ fn start_grab(robot: &mut RobotState, area_ratio: f32) {
 
 /// 抓取序列走完最后一格之后的去向。
 ///
-/// `bucket_mode` 为真:球已在手上,不进放开的三段收尾,而是直接转入
+/// `verdict` 是抬臂结束时读回的夹爪判定:`Missed`(空合)时球根本不在爪上,
+/// 无论 `bucket_mode` 都不能往下走 —— 去追桶就是抱着空爪跑一圈,
+/// 所以直接走开爪归位的收尾,回追球重新逼近。
+///
+/// `bucket_mode` 为真且夹到了球:球已在手上,不进放开的三段收尾,而是直接转入
 /// “追蓝桶 → 放进桶”流程(`robot.bucket.start()`),由主循环的 `bucket.is_active()`
 /// 分支接管。为假(旧行为):回初始位置 → 原地松爪 → 继续追球。
 ///
-/// 单独抽出来是因为 `arm.grab()` 阻塞约 3.7s(`arm.rs:61-72`),想验证这一段就得绕开它。
-fn finish_grab(robot: &mut RobotState, now: Instant, bucket_mode: bool) {
+/// 单独抽出来是因为 `arm.grab()` 阻塞约 3.7s(`arm.rs:62-75`),想验证这一段就得绕开它。
+fn finish_grab(robot: &mut RobotState, now: Instant, bucket_mode: bool, verdict: GrabVerdict) {
+    if matches!(verdict, GrabVerdict::Missed { .. }) {
+        // 空合:开爪归位后回追球,重新走一轮 追球 → 抓球,不进桶流程。
+        eprintln!("[grab] empty claw -> reopen, resume chase instead of the next stage");
+        robot.gate.reset();
+        robot.steer_phase = SteerPhase::Straight;
+        robot.grab_phase = GrabPhase::Closing {
+            until: now + Duration::from_millis(config::get().grab.grab_close_ms),
+        };
+        return;
+    }
     if bucket_mode {
         // 与桶流程唯一的分岔点:不松爪,夹着球去找桶。
         eprintln!("[bucket] ball held -> searching for bucket");
@@ -1050,10 +1064,12 @@ fn advance_grab(robot: &mut RobotState, motor: &mut Motor, arm: &mut Arm, bucket
             // 而帧周期(~60ms,相机卡顿时更久)直接量化了脉冲长度 —— 同一条命令
             // 有时只转半截、有时一股脑转过去,落爪位置跟着漂。
             blind_turn_sequence(motor);
-            // arm.grab() 阻塞约 3.7s,结束时夹爪闭合、机械臂停在 LIFT 位 —— 球在手上。
-            arm.grab();
+            // arm.grab() 阻塞约 3.7s,结束时夹爪闭合、机械臂停在 LIFT 位。
+            // 返回值是抬臂后读回的夹爪角度:夹到球才会走向桶/放球,空合(含抬臂
+            // 途中掉球)则回追球重来。
+            let verdict = arm.grab();
             // 上面两段都是阻塞的,`now` 已过期,收尾计时从当前重新起算。
-            finish_grab(robot, Instant::now(), bucket_mode);
+            finish_grab(robot, Instant::now(), bucket_mode, verdict);
         }
 
         GrabPhase::Closing { until } => {
@@ -1186,7 +1202,7 @@ mod tests {
         pulse_ms, scaled_center_margin, scaled_px, steer_turn, straight_forward, turn_amplitude,
         turn_forward_bias,
     };
-    use crate::arm::Arm;
+    use crate::arm::{Arm, GrabVerdict};
     use crate::config::{self, GrabTurnDirection};
     use crate::detector::{Box2d, Detection};
     use crate::motor::Motor;
@@ -1428,7 +1444,7 @@ mod tests {
     fn grab_tail_goes_home_then_releases() {
         let mut robot = RobotState::default();
         let now = Instant::now();
-        finish_grab(&mut robot, now, false);
+        finish_grab(&mut robot, now, false, GrabVerdict::Held { pulse: 1200 });
 
         // 不松爪、也不停在 Idle:先走归位/放开的三段。
         assert!(matches!(robot.grab_phase, GrabPhase::Closing { .. }));
@@ -1438,10 +1454,63 @@ mod tests {
     #[test]
     fn finish_grab_hands_off_to_bucket_when_enabled() {
         let mut robot = RobotState::default();
-        finish_grab(&mut robot, Instant::now(), true);
+        finish_grab(
+            &mut robot,
+            Instant::now(),
+            true,
+            GrabVerdict::Held { pulse: 1200 },
+        );
         // 不进 Closing/Releasing:抓取状态机复位,球夹着,交给桶流程。
         assert!(matches!(robot.grab_phase, GrabPhase::Idle));
         assert!(robot.bucket.is_active());
+    }
+
+    /// 空合(夹爪一路闭合到位):球没夹住,即使开了桶流程也不能去追桶 ——
+    /// 得开爪归位后回追球,重新走一轮 追球 → 抓球。
+    #[test]
+    fn empty_claw_skips_the_bucket_and_rechases() {
+        let mut robot = RobotState {
+            status: RobotStatus::GrabTennis,
+            gate: GrabGate {
+                ema: 0.5,
+                engaged: true,
+                since: Some(Instant::now()),
+            },
+            ..RobotState::default()
+        };
+        let (mut motor, mut arm) = (Motor::mock(), Arm::mock());
+        finish_grab(
+            &mut robot,
+            Instant::now(),
+            true,
+            GrabVerdict::Missed { pulse: 790 },
+        );
+
+        assert!(!robot.bucket.is_active(), "空合不能进桶流程");
+        assert!(
+            matches!(robot.grab_phase, GrabPhase::Closing { .. }),
+            "应走开爪归位的收尾"
+        );
+        assert!(!robot.gate.engaged && robot.gate.since.is_none(), "门控应复位");
+
+        // 收尾三段推完后必须回到追球,而不是停住。
+        for phase in [
+            GrabPhase::Closing {
+                until: Instant::now() - Duration::from_millis(1),
+            },
+            GrabPhase::Releasing {
+                until: Instant::now() - Duration::from_millis(1),
+            },
+            GrabPhase::Homing {
+                until: Instant::now() - Duration::from_millis(1),
+            },
+        ] {
+            robot.grab_phase = phase;
+            advance_grab(&mut robot, &mut motor, &mut arm, true);
+        }
+        assert!(matches!(robot.grab_phase, GrabPhase::Idle));
+        assert!(matches!(robot.status, RobotStatus::ChaseTennis));
+        assert!(!robot.bucket.is_active());
     }
 
     /// 收尾三段走完必须回到追球状态 —— 否则抓一次就停机,不再抓下一个球。

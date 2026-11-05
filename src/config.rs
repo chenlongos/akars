@@ -11,8 +11,8 @@
 //!   因此单元测试无需初始化即可确定性地跑到默认参数上。
 
 use crate::arm::{
-    ANGLE_MAX, ID2_ANGLE_CLOSE, ID2_ANGLE_OPEN, PULSE_MAX, PULSE_MIN, SERVO0_GRAB, SERVO0_LIFT,
-    SERVO0_READY, SERVO1_GRAB, SERVO1_LIFT, SERVO1_READY,
+    ANGLE_MAX, GRAB_CLOSE_TOLERANCE_DEG, GRAB_VERIFY, ID2_ANGLE_CLOSE, ID2_ANGLE_OPEN, PULSE_MAX,
+    PULSE_MIN, SERVO0_GRAB, SERVO0_LIFT, SERVO0_READY, SERVO1_GRAB, SERVO1_LIFT, SERVO1_READY,
 };
 use crate::motor::MotorConfig;
 use crate::robot::{
@@ -209,6 +209,10 @@ pub struct ArmConfig {
     pub servo0_lift: f32,
     /// 舵机1 抬起(持球)角度。
     pub servo1_lift: f32,
+    /// 抓取完成后是否读回夹爪闭合角度,据此判断有没有真的夹到球。
+    pub grab_verify: bool,
+    /// 空合判定容差(度):读回角度在闭合角以上此值以内仍算"空合"。
+    pub grab_close_tolerance_deg: f32,
     /// 每条 set_angle 指令的运动时长(time_ms)。
     pub grab_move_time_ms: i32,
     /// grab() 第 1 步(伸到最低、张爪)后的等待。
@@ -233,6 +237,8 @@ impl Default for ArmConfig {
             servo1_grab: SERVO1_GRAB,
             servo0_lift: SERVO0_LIFT,
             servo1_lift: SERVO1_LIFT,
+            grab_verify: GRAB_VERIFY,
+            grab_close_tolerance_deg: GRAB_CLOSE_TOLERANCE_DEG,
             grab_move_time_ms: 1000,
             grab_settle_pre_close_ms: 1500,
             grab_settle_close_ms: 1000,
