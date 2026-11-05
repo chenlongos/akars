@@ -792,11 +792,11 @@ fn servo_log() -> bool {
     std::env::var("AKARS_SERVO_LOG").is_ok()
 }
 
-/// 功能开关：「抓起来 → 追蓝桶 → 放进桶」流程，由配置文件
-/// `[grab] chase_bucket` 决定（缺省开）；临时调试还可用 `AKARS_NO_BUCKET`
+/// 功能开关：「抓起来 → 追桶 → 放进桶」流程，由配置文件
+/// `[bucket] chase_bucket` 决定（缺省开）；临时调试还可用 `AKARS_NO_BUCKET`
 /// 环境变量强制关掉，不必改卡上的配置。
 fn bucket_enabled() -> bool {
-    config::get().grab.chase_bucket && std::env::var("AKARS_NO_BUCKET").is_err()
+    config::get().bucket.chase_bucket && std::env::var("AKARS_NO_BUCKET").is_err()
 }
 
 /// 推进转向阶段。

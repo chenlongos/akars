@@ -89,8 +89,9 @@ Useful options:
 
 The chassis (chasing, lane-keeping, turn pulses, approach-speed grading, search
 and back-off), the grab state machine (distance thresholds, confirm frames, per-
-phase durations), the arm (servo pose angles, pulse calibration, grasp timings)
-and the motor mapping (`speed_scale`, `min_speed`, `ppr`, `pwm_freq`) are read
+phase durations), the arm (servo pose angles, pulse calibration, grasp timings),
+the bucket chase (target colour, approach speeds, find/deposit timings) and the
+motor mapping (`speed_scale`, `min_speed`, `ppr`, `pwm_freq`) are read
 from a TOML file at startup instead of being compiled in. Edit the file and
 restart the program — no rebuild needed.
 
@@ -140,11 +141,40 @@ restart the program — no rebuild needed.
   judging immediately would re-use the pre-back-off (too-close) reading and back off
   forever. That window never moves the chassis, so its frame-based timing cannot
   turn into displacement.
-- `[grab] chase_bucket = true | false` decides whether a successful grab hands over
-  to the "chase the blue bucket -> deposit the ball" loop (`true`, the default) or
-  the claw just releases in place and the car chases the next ball (`false`).
-  For quick on-car debugging the `AKARS_NO_BUCKET` environment variable force-
-  disables the bucket loop without editing the config file.
+- `[bucket] chase_bucket = true | false` decides whether a successful grab hands over
+  to the "chase the bucket -> deposit the ball" loop (`true`, the default) or the
+  claw just releases in place and the car chases the next ball (`false`). It used to
+  live in `[grab]`; a stale `[grab] chase_bucket` is now ignored, so move it into
+  `[bucket]`. For quick on-car debugging the `AKARS_NO_BUCKET` environment variable
+  force-disables the bucket loop without editing the config file.
+- `[bucket]` holds everything the bucket chase itself needs, so a colour or
+  distance retune never needs a rebuild: the target colour as a **name**
+  (`bucket_color = "blue" | "red" | "green"`, blue by default), the blob
+  `min_area_fullres`, the `confirm_frames` / `lost_frames` de-bounce counters, the
+  `search_speed` spin, the two-stage approach (`approach_speed`, `brake_speed`,
+  `area_brake`, `area_deposit`), the proportional steer (`k_turn`, `max_bias`,
+  `center_dead_zone`) and the deposit timings (`brake_ms`, `deposit_ms`, `home_ms`,
+  `deposit_backoff_ms`). `deposit_backoff_ms` is a short straight reverse run right
+  after the arm returns home: the car stops practically against the bucket rim, and
+  the very next thing it does is spin in place to search for a ball, which sweeps the
+  chassis into the bucket — backing off first clears it. Unlike the pre-grab back-off
+  (a wall-clock pulse that runs to completion inside one call, because it has to stop
+  the claw at a precise distance) this one only has to get clear of the rim, so it is
+  an ordinary frame-stepped timed phase at `[chassis] backward_speed`: a frame of
+  slop does not matter and the camera loop keeps running. `0` disables it.
+  The hue window, the saturation/value floors and the chroma-plane fast reject behind
+  each colour name are **not** in the file: they live in the preset table in
+  `src/bucket.rs`, because a hand-tuned H/S/V window is exactly how you
+  lose a blue bucket (most real blues sit near H=210, not at 240). Add a colour
+  there if you need one; yellow is deliberately absent since the tennis ball is
+  yellow-green. Two guardrails that used to be compile-time assertions now run at
+  load time: both approach speeds are raised to the minimum speed that actually
+  moves the car (`>= 20`), and `brake_speed` is capped at `approach_speed` — the
+  reference's creep speed of 5 maps to ~15% PWM, the car never moves in the brake
+  band, the area stops growing and the car parks forever at `area_brake`.
+  `akars capture --bucket` reads this file too and prints the colour it is judged by
+  (including the mean H of the saturated pixels in view), so you can tell which name
+  fits the real bucket.
 - **A grab only counts if the claw actually closed on the ball.** After the full
   grab sequence — including the lift — `arm.grab()` reads the claw position back
   over the servo bus (ZP10S `#002PRAD!` -> `#002P1500!`) and compares it with the

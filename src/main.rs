@@ -387,6 +387,9 @@ fn run_detect(cli: DetectCli) {
 }
 
 fn run_capture(cli: CaptureCli) {
+    // 桶色/最小面积的标定同样要看到调好的配置:否则 `capture --bucket` 打出来的
+    // 判据和整车实际用的对不上。板端默认路径与其它子命令一致。
+    config::init(config::load(std::path::Path::new(DEFAULT_CONFIG_PATH)));
     let mut camera = match UsbCamera::open(&cli.camera) {
         Ok(camera) => {
             let info = camera.info();
@@ -427,13 +430,8 @@ fn run_capture(cli: CaptureCli) {
         let (w, h) = (frame.width as i32, frame.height as i32);
         // 本分支取帧路径固定返回 YUV422 planar。
         let planar = akars::camera::PlanarFormat::I422;
-        match akars::bucket::detect_bucket(
-            &frame.pixels,
-            w,
-            h,
-            planar,
-            akars::bucket::BUCKET_MIN_AREA_FULLRES,
-        ) {
+        let bcfg = config::get().bucket;
+        match akars::bucket::detect_bucket(&frame.pixels, w, h, planar, bcfg.min_area_fullres) {
             Some(r) => eprintln!(
                 "[bucket] found area={:.3} ({:.0}% of frame) box=({},{},{},{}) center=({},{})",
                 r.area_ratio,
@@ -447,15 +445,18 @@ fn run_capture(cli: CaptureCli) {
             ),
             None => eprintln!(
                 "[bucket] not found (min_area={} full-res px)",
-                akars::bucket::BUCKET_MIN_AREA_FULLRES
+                bcfg.min_area_fullres
             ),
         }
         // 判不出来时最有用的一条:桶的实际色相落在哪。
+        let color = akars::bucket::target_color();
         match akars::bucket::bucket_color_stats(&frame.pixels, w, h, planar) {
             Some((hue, sat, val, n)) => eprintln!(
-                "[bucket] coloured pixels: mean H={hue} S={sat} V={val} (n={n}, 判据 H∈[{},{}] 且 S≥80 V≥50)",
-                akars::bucket::BUCKET_HUE_MIN,
-                akars::bucket::BUCKET_HUE_MAX
+                "[bucket] coloured pixels: mean H={hue} S={sat} V={val} (n={n}, 目标色 {} 判据 {} 且 S≥{} V≥{})",
+                color.name,
+                color.hue_window_label(),
+                color.min_sat,
+                color.min_val
             ),
             None => eprintln!("[bucket] no coloured pixels in view (S/V 下限全灭)"),
         }

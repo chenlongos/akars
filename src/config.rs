@@ -5,14 +5,22 @@
 //! 装进全局 [`OnceLock`];调参只改配置文件、不用重编译。
 //!
 //! 设计要点:
-//! - 默认值直接取自 `robot.rs` / `arm.rs` 里原来的 `const`(单一真值来源),所以
-//!   文件缺失、解析失败或字段缺省时逐项回退,行为与旧版本完全一致。
+//! - 默认值直接取自 `robot.rs` / `arm.rs` / `bucket.rs` 里原来的 `const`(单一真值来
+//!   源),所以文件缺失、解析失败或字段缺省时逐项回退,行为与旧版本完全一致。
+//! - 目标桶色只暴露颜色名(`[bucket] bucket_color = "blue"`);色相窗口、饱和度/亮度
+//!   下限这些检测内情留在 `bucket.rs` 的预设表里,不摆到配置文件上。
 //! - 控制函数通过 [`get`] 读取,不改签名;[`get`] 在未 [`init`] 时返回默认值,
 //!   因此单元测试无需初始化即可确定性地跑到默认参数上。
 
 use crate::arm::{
     ANGLE_MAX, GRAB_CLOSE_TOLERANCE_DEG, GRAB_VERIFY, ID2_ANGLE_CLOSE, ID2_ANGLE_OPEN, PULSE_MAX,
     PULSE_MIN, SERVO0_GRAB, SERVO0_LIFT, SERVO0_READY, SERVO1_GRAB, SERVO1_LIFT, SERVO1_READY,
+};
+use crate::bucket::{
+    BUCKET_APPROACH_SPD, BUCKET_AREA_BRAKE, BUCKET_AREA_DEPOSIT, BUCKET_BRAKE_MS, BUCKET_BRAKE_SPD,
+    BUCKET_CENTER_DEAD_ZONE, BUCKET_CONFIRM_CNT, BUCKET_DEPOSIT_BACKOFF_MS, BUCKET_DEPOSIT_MS,
+    BUCKET_HOME_MS, BUCKET_K_TURN, BUCKET_LOST_FRAMES, BUCKET_MAX_BIAS, BUCKET_MIN_AREA_FULLRES,
+    BUCKET_SEARCH_SPD,
 };
 use crate::motor::MotorConfig;
 use crate::robot::{
@@ -156,8 +164,6 @@ pub struct GrabConfig {
     pub grab_release_ms: u64,
     /// 爪子归位后回到追球前的等待时长。
     pub grab_home_ms: u64,
-    /// 抓到球后是否进入“追蓝桶 → 放球”循环;false 退回旧行为(抓完原地松爪再追球)。
-    pub chase_bucket: bool,
 }
 
 impl Default for GrabConfig {
@@ -178,7 +184,95 @@ impl Default for GrabConfig {
             grab_close_ms: GRAB_CLOSE_MS,
             grab_release_ms: GRAB_RELEASE_MS,
             grab_home_ms: GRAB_HOME_MS,
+        }
+    }
+}
+
+/// 目标桶色。配置文件里只写颜色名(`bucket_color = "blue"`)。
+///
+/// 色相窗口、饱和度/亮度下限是实现细节,放在 `bucket.rs` 的预设表里,由本枚举去查表 ——
+/// 让使用者去调 H/S/V 只会调坏:窗口得盖住真实的深蓝/浅蓝,还被网球的黄绿挡着。
+///
+/// 只提供与网球(H 约 55~70)分得开的颜色:黄色正好压在球身上,选了会把手里那颗球当
+/// 成桶,所以刻意不提供。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BucketColor {
+    /// 蓝色(默认)。
+    #[default]
+    Blue,
+    /// 红色。
+    Red,
+    /// 绿色。
+    Green,
+}
+
+/// 追桶/放桶参数:是否追桶、目标颜色、两级趋近速度、中心死区、找桶与放球时序。
+///
+/// 闭环比追球简单得多(桶是静止大目标),所以这里的值大多沿用参考实现;换颜色、
+/// 换桶尺寸都是改这里,不用重编译。
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct BucketConfig {
+    /// 抓到球后是否进入“追桶 → 放球”循环;false 退回旧行为(抓完原地松爪再追球)。
+    pub chase_bucket: bool,
+    /// 目标桶色:只写颜色名,色相窗口那种内情不进配置文件。
+    pub bucket_color: BucketColor,
+    /// 连通域最小面积(全分辨率像素数,色度网格上按采样率折算)。
+    pub min_area_fullres: i32,
+    /// 连续多少帧看到桶才确认(防抖)。
+    pub confirm_frames: i32,
+    /// 趋近中连续多少帧看不到桶 → 退回搜索。
+    pub lost_frames: i32,
+    /// 找不到桶时原地旋转搜索的速度。
+    pub search_speed: i32,
+    /// 趋近速度(远方一档)。
+    pub approach_speed: i32,
+    /// 制动区(面积 ≥ area_brake)的蠕行速度。须高于“下单但车不动”的下限,且不高于
+    /// approach_speed;加载时会被钳到合法区间(见 bucket.rs 的 `approach_speeds`)。
+    pub brake_speed: i32,
+    /// 进入制动区的面积比(降到蠕行速度,避免撞桶)。
+    pub area_brake: f32,
+    /// 够近可放球的面积比。
+    pub area_deposit: f32,
+    /// 比例转向增益:bias = k_turn × 偏差 / 半宽。
+    pub k_turn: f32,
+    /// 转向 bias 的上限(单轮加减的最大幅值)。
+    pub max_bias: i32,
+    /// 中心死区(全分辨率像素),偏差在此内不转。
+    pub center_dead_zone: i32,
+    /// 放球前的硬刹时长(ms)。
+    pub brake_ms: u64,
+    /// 松爪后等舵机走完的时长(ms)。
+    pub deposit_ms: u64,
+    /// 机械臂归位后、回追球前的等待(ms)。
+    pub home_ms: u64,
+    /// 放完球后的倒退时长(ms):车头几乎贴着桶,不退就原地旋转会蹭到桶壁。
+    /// 只求退开、不求停准,所以按帧推进即可(不是抓球那个跑满墙钟的后退脉冲)。
+    /// 0 = 不退。速度沿用 `[chassis] backward_speed`。
+    pub deposit_backoff_ms: u64,
+}
+
+impl Default for BucketConfig {
+    fn default() -> Self {
+        Self {
             chase_bucket: true,
+            bucket_color: BucketColor::default(),
+            min_area_fullres: BUCKET_MIN_AREA_FULLRES,
+            confirm_frames: BUCKET_CONFIRM_CNT,
+            lost_frames: BUCKET_LOST_FRAMES,
+            search_speed: BUCKET_SEARCH_SPD,
+            approach_speed: BUCKET_APPROACH_SPD,
+            brake_speed: BUCKET_BRAKE_SPD,
+            area_brake: BUCKET_AREA_BRAKE,
+            area_deposit: BUCKET_AREA_DEPOSIT,
+            k_turn: BUCKET_K_TURN,
+            max_bias: BUCKET_MAX_BIAS,
+            center_dead_zone: BUCKET_CENTER_DEAD_ZONE,
+            brake_ms: BUCKET_BRAKE_MS,
+            deposit_ms: BUCKET_DEPOSIT_MS,
+            home_ms: BUCKET_HOME_MS,
+            deposit_backoff_ms: BUCKET_DEPOSIT_BACKOFF_MS,
         }
     }
 }
@@ -273,7 +367,7 @@ impl Default for MotorFileConfig {
     }
 }
 
-/// 顶层配置:TOML 的四个 section。整份及每个 section 都允许缺省,缺省即回退到
+/// 顶层配置:TOML 的五个 section。整份及每个 section 都允许缺省,缺省即回退到
 /// 内置默认值。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Deserialize)]
 #[serde(default)]
@@ -281,6 +375,7 @@ pub struct Config {
     pub chassis: ChassisConfig,
     pub grab: GrabConfig,
     pub arm: ArmConfig,
+    pub bucket: BucketConfig,
     pub motor: MotorFileConfig,
 }
 
@@ -339,7 +434,7 @@ pub fn load(path: &Path) -> Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, GrabTurnDirection, get};
+    use super::{BucketColor, BucketConfig, Config, GrabTurnDirection, get};
 
     /// 缺省字段回退到内置默认,给出的字段生效。
     #[test]
@@ -365,12 +460,58 @@ turn_pulse_speed = 33
         assert_eq!(get(), Config::default());
     }
 
-    /// chase_bucket 缺省为开,TOML 显式写 false 才关掉追桶放桶循环。
+    /// `[bucket]` 段:给出的字段生效,其余逐项回退默认 —— 追桶参数改配置文件即可。
+    #[test]
+    fn bucket_section_overrides_defaults() {
+        let cfg: Config = toml::from_str(
+            "[bucket]\nbucket_color = \"red\"\napproach_speed = 30\narea_deposit = 0.85\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.bucket.bucket_color, BucketColor::Red);
+        assert_eq!(cfg.bucket.approach_speed, 30);
+        assert_eq!(cfg.bucket.area_deposit, 0.85);
+        assert_eq!(
+            cfg.bucket.search_speed,
+            BucketConfig::default().search_speed
+        );
+        assert_eq!(cfg.bucket.home_ms, BucketConfig::default().home_ms);
+    }
+
+    /// 目标色只认颜色名,缺省是蓝。
+    #[test]
+    fn bucket_colour_parses_and_defaults() {
+        assert_eq!(Config::default().bucket.bucket_color, BucketColor::Blue);
+        let cfg: Config = toml::from_str("[bucket]\nbucket_color = \"green\"\n").unwrap();
+        assert_eq!(cfg.bucket.bucket_color, BucketColor::Green);
+    }
+
+    /// 拼错的颜色名会让整份文件解析失败(加载器打印警告后全走默认),而不是静默
+    /// 挑一个别的窗口 —— 挑错了车会对着一面墙追很久。
+    #[test]
+    fn unknown_bucket_colour_is_rejected() {
+        assert!(toml::from_str::<Config>("[bucket]\nbucket_color = \"purple\"\n").is_err());
+    }
+
+    /// 仓库里的 `akars.example.toml` 必须能整份解析:serde 会静默忽略拼错的键名,
+    /// 只有真解析一次才能发现(例如把 min_area_fullres 打成 trl_min_area_fullres)。
+    #[test]
+    fn example_toml_parses_and_keeps_bucket_values() {
+        let cfg: Config = toml::from_str(include_str!("../akars.example.toml"))
+            .expect("akars.example.toml 解析失败");
+        // 抽几个键确认确实落进了结构体(改示例里的标定值时同步更新这里)。
+        assert_eq!(cfg.bucket.bucket_color, BucketColor::Blue);
+        assert_eq!(cfg.bucket.min_area_fullres, 1000);
+        assert_eq!(cfg.bucket.k_turn, 20.0);
+        // 只写部分键的文件仍应保留其它 section 的默认值。
+        assert!(cfg.bucket.chase_bucket);
+    }
+
+    /// chase_bucket 在 `[bucket]` 段,缺省为开,TOML 显式写 false 才关掉追桶循环。
     #[test]
     fn chase_bucket_parses_and_defaults() {
-        assert!(Config::default().grab.chase_bucket);
-        let cfg: Config = toml::from_str("[grab]\nchase_bucket = false\n").unwrap();
-        assert!(!cfg.grab.chase_bucket);
+        assert!(Config::default().bucket.chase_bucket);
+        let cfg: Config = toml::from_str("[bucket]\nchase_bucket = false\n").unwrap();
+        assert!(!cfg.bucket.chase_bucket);
     }
 
     /// grab_turn_direction 接受 "left"/"right",缺省回退到 Left。

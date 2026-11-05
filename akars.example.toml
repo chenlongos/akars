@@ -51,7 +51,7 @@ grab_turn_gap_ms = 100         # 两次盲转之间的停稳间隔(段末主动�
 grab_close_ms = 200            # 闭爪后等待伺服到位
 grab_release_ms = 100          # 松开后等待伺服到位
 grab_home_ms = 100             # 归位后回到追球前的等待
-chase_bucket = true            # 抓到球后进入“追蓝桶→放球”循环;false 则抓完原地松爪再追下一个球
+# 追桶开关与追桶本体的参数(目标颜色/趋近速度/找桶与放球时序)全在下面的 [bucket] 段。
 # 抓取是否成功不看流程走完,而看夹爪闭合角度:球顶住爪口时舵机走不到闭合角,
 # 读回角度会明显大于 [arm] id2_angle_close(容差 grab_close_tolerance_deg)。
 # 空合 → 开爪归位 → 直接回追球重走 追球→抓球,不进追桶/放球。
@@ -75,6 +75,29 @@ grab_move_time_ms = 1000              # 每条 set_angle 指令的运动时长
 grab_settle_pre_close_ms = 1500       # 伸到最低、张爪后的等待
 grab_settle_close_ms = 1000           # 闭爪后的等待
 grab_settle_lift_ms = 1200            # 抬起后的等待
+
+# ── 追桶/放球:是否追桶、目标颜色、两级趋近、找桶与放球时序 ──
+[bucket]
+chase_bucket = true            # 抓到球后进入“追桶→放球”循环;false 则抓完原地松爪再追下一个球
+# 目标桶色只写颜色名:blue(默认)/ red / green。色相窗口与饱和度/亮度下限是检测内情,
+# 由代码里的预设表给出,不用也不应该在这里调 —— 换桶色只改这一行,不用重编译。
+# 拿不准该选哪个:对着真桶跑 `akars capture --bucket`,它会打出画面的 mean H。
+bucket_color = "blue"
+min_area_fullres = 1000        # 连通域最小面积(全分辨率像素数)
+confirm_frames = 3             # 连续看到桶多少帧才确认(防抖)
+lost_frames = 10               # 趋近中连续丢多少帧 → 退回搜索
+search_speed = 24              # 找不到桶时原地旋转速度(不能低于推得动整车的下限)
+approach_speed = 25            # 趋近速度(远方一档)
+brake_speed = 22               # 制动区(面积 ≥ area_brake)的蠕行速度:须 ≥ 20 且 ≤ approach_speed
+area_brake = 0.70              # 桶面积比 ≥ 此值 → 进制动区,降到蠕行速度
+area_deposit = 0.90            # 桶面积比 ≥ 此值 → 够近,停车放球
+k_turn = 20.0                  # 比例转向增益:bias = k_turn × 偏差 / 半宽
+max_bias = 8                   # 转向 bias 上限(单轮加减的最大幅值)
+center_dead_zone = 15          # 中心死区(全分辨率像素),桶大目标不需要亚像素对准
+brake_ms = 350                 # 放球前硬刹时长(墙钟定时,停稳后再松爪)
+deposit_ms = 500               # 松爪后等舵机走完,再让机械臂归位
+home_ms = 100                  # 归位后回追球前的等待
+deposit_backoff_ms = 300       # 放完球先倒这一小段再回追球(车头贴着桶,原地旋转会蹭到桶壁);只求退开、不求停准,速度用 [chassis] backward_speed;0 = 不退
 
 # ── 电机映射:PWM 缩放与死区下限(ppr/pwm_freq 随 CMD_CONFIG 下发) ──
 [motor]

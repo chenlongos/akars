@@ -1,4 +1,5 @@
-//! 彩色桶识别 + 「抓起来 → 找桶 → 放进去」的状态机。**当前目标是蓝色**。
+//! 彩色桶识别 + 「抓起来 → 找桶 → 放进去」的状态机。**默认目标是蓝色**
+//! (`[bucket] bucket_color`,预设表见 `color_preset`)。
 //!
 //! 移植自 /tmp/aka-rk3588（同类小车的 C++ 实现）：
 //!   - 检测器：`test_cmds.cpp:458-704`（`_rgb2hsv` / `_is_red` / `_find_red_boxes`）
@@ -17,8 +18,9 @@
 //!      `[chassis] turn_reverse`，和追球/丢球搜索/找桶旋转同源，不然轮子通道反接的
 //!      底盘在追桶时会左右反向。
 //!   4. 舵机角度不搬（两边标定不同），只搬时序。
-//!   5. **颜色不同**：参考写死红色，我们用蓝色。颜色只由 `BUCKET_HUE_MIN/MAX` 和
-//!      `chroma_excludes_target` 这一对决定，其余代码颜色无关、换色不用改。
+//!   5. **目标色可配**:参考写死红色,我们用蓝色。颜色判据(色相窗口 + S/V 下限 + 早退
+//!      用的色度平面)全部收在 `color_preset` 这张预设表里,配置文件只写颜色名
+//!      (`[bucket] bucket_color = "blue"`);其余代码颜色无关,加一种颜色只加一行。
 
 use crate::arm::Arm;
 use crate::camera::PlanarFormat;
@@ -26,12 +28,17 @@ use crate::config;
 use crate::motor::Motor;
 use std::time::{Duration, Instant};
 
-// ── 趋近参数（与参考同名同值） ────────────────────────────────────────────
+// ── 趋近参数的**内置默认值**（与参考同名同值）─────────────────────────────
+//
+// 下列常量全部可以通过配置文件 `[bucket]` 段覆盖（`config::BucketConfig`）。
+// 这里只留默认值，作为单一真值来源：`config.rs` 的默认值直接取这些常量，
+// 所以配置文件缺项时行为与硬编码时代完全一致，改参数则不用重编译。
+
 /// 桶面积比 ≥ 此值 → 够近，可以放球。
-const BUCKET_AREA_DEPOSIT: f32 = 0.90;
+pub(crate) const BUCKET_AREA_DEPOSIT: f32 = 0.90;
 /// 桶面积比 ≥ 此值 → 进入制动区，降到蠕行速度（避免撞桶）。
-const BUCKET_AREA_BRAKE: f32 = 0.70;
-const BUCKET_APPROACH_SPD: i32 = 25;
+pub(crate) const BUCKET_AREA_BRAKE: f32 = 0.70;
+pub(crate) const BUCKET_APPROACH_SPD: i32 = 25;
 /// 制动区（面积 ≥ 0.70）的蠕行速度。
 ///
 /// **不能照抄参考的 5**。参考写 5，但它的 `min_speed` 同样是 15，所以 5 映射后只有
@@ -40,42 +47,50 @@ const BUCKET_APPROACH_SPD: i32 = 25;
 /// 参考那边多半也没真跑进过制动区。
 ///
 /// 取 22：高于下限且留一点余量，又明显低于趋近档 25，两级才还有意义。
-const BUCKET_BRAKE_SPD: i32 = 22;
+pub(crate) const BUCKET_BRAKE_SPD: i32 = 22;
 /// 实测能推得动整车的最低速度档。低于它 PWM 过不了静摩擦，车"看着在下令、不动"
 /// （来源：`robot.rs` 接近速度分级那段的实测结论，值 20 → 26% PWM）。
+/// 这条是**护栏不是参数**：不顺配置文件下发，两级速度都按它钳制（见 `approach_speeds`）。
 const MIN_MOVING_SPEED: i32 = 20;
 
-/// 编译期护栏：两级趋近速度都必须高于"下单但车不动"的下限。
+/// 两级趋近速度的加载期归一化。
 ///
 /// 踩过这个坑：参考的制动档 5 映射后只有 15% PWM，车在制动区里根本不动，而面积又不会
-/// 再涨，于是永远卡在 0.70~0.89 —— 场上表现为"靠近桶就站住"。约束写死在这里，以后谁
-/// 把这两个值调回去都过不了编译，不用等跑测试。
-const _: () = {
-    assert!(BUCKET_BRAKE_SPD >= MIN_MOVING_SPEED);
-    assert!(BUCKET_APPROACH_SPD >= MIN_MOVING_SPEED);
-    // 但仍要比趋近档慢，否则分两级没意义。
-    assert!(BUCKET_BRAKE_SPD < BUCKET_APPROACH_SPD);
-};
+/// 再涨，于是永远卡在 0.70~0.89 —— 场上表现为"靠近桶就站住"。
+/// 这几个值原本用编译期断言锁死（谁调回去都过不了编译）；参数外置到配置文件之后编译期
+/// 看不到取值，所以改成在这里钳制：两档都抬到能推动整车的下限，制动档不超过趋近档。
+fn approach_speeds(cfg: &config::BucketConfig) -> (i32, i32) {
+    let approach = cfg.approach_speed.clamp(MIN_MOVING_SPEED, 100);
+    let brake = cfg.brake_speed.clamp(MIN_MOVING_SPEED, approach);
+    (approach, brake)
+}
+
 /// 转向增益：bias = K × 偏差 / 半宽，夹在 ±MAX_BIAS。
-const BUCKET_K_TURN: f32 = 20.0;
-const BUCKET_MAX_BIAS: i32 = 8;
+pub(crate) const BUCKET_K_TURN: f32 = 20.0;
+pub(crate) const BUCKET_MAX_BIAS: i32 = 8;
 /// 中心死区（全分辨率像素）。注意它比追球的死区紧得多：桶是大目标，不需要亚像素级对准。
-const BUCKET_CENTER_DEAD_ZONE: i32 = 15;
+pub(crate) const BUCKET_CENTER_DEAD_ZONE: i32 = 15;
 /// 找不到桶时原地右转的速度。**故意不用参考的 12**，见文件头注释。
-const BUCKET_SEARCH_SPD: i32 = 24;
+pub(crate) const BUCKET_SEARCH_SPD: i32 = 24;
 /// 趋近中连续多少帧看不到桶 → 退回搜索。
-const BUCKET_LOST_FRAMES: i32 = 10;
+pub(crate) const BUCKET_LOST_FRAMES: i32 = 10;
 /// 连续多少帧看到桶 → 确认（防抖）。
-const BUCKET_CONFIRM_CNT: i32 = 3;
+pub(crate) const BUCKET_CONFIRM_CNT: i32 = 3;
 /// 放球前的硬刹时长。参考在停车前整段 `motor.brake()`，我们分帧重发。
-const BUCKET_BRAKE_MS: u64 = 350;
+pub(crate) const BUCKET_BRAKE_MS: u64 = 350;
 /// 松爪后等舵机走完，再让机械臂归位。
-const BUCKET_DEPOSIT_MS: u64 = 500;
+pub(crate) const BUCKET_DEPOSIT_MS: u64 = 500;
 /// 归位后等一小会儿再回追球，别让底盘在手臂还在摆的时候就起步。
-const BUCKET_HOME_MS: u64 = 100;
+pub(crate) const BUCKET_HOME_MS: u64 = 100;
+/// 放完球后的**倒退时长**（ms）。车头此刻几乎贴着桶，不退就直接“原地旋转找球”，
+/// 车身一扫就扫到桶壁。
+///
+/// 这里只求“退开一点”，不要求停准 —— 所以按帧推进的定时相就够用，不走抓球那个
+/// 跑满墙钟的后退脉冲（那个是为了退准）。0 = 不退（旧行为）。速度不给新参数，
+/// 直接用 `[chassis] backward_speed`：和“抓球时太近先退”是同一个物理动作。
+pub(crate) const BUCKET_DEPOSIT_BACKOFF_MS: u64 = 300;
 /// 连通域的最小面积（**全分辨率像素数**，色度网格上按采样率折算）。
-/// 公开是因为 `capture --bucket` 标定时要用同一口径。
-pub const BUCKET_MIN_AREA_FULLRES: i32 = 1000;
+pub(crate) const BUCKET_MIN_AREA_FULLRES: i32 = 1000;
 
 /// 调参开关：AKARS_BUCKET_LOG=1 时每帧打印桶状态机的决策（默认关）。
 fn bucket_log() -> bool {
@@ -215,15 +230,15 @@ pub fn detect_bucket(
 /// 诊断用：把画面里"有颜色"（够饱和、够亮）的采样点的 H/S/V 均值报出来。
 ///
 /// 用来对着真桶标定颜色：`detect_bucket` 判不出来时，这里能告诉你桶的实际色相
-/// 落在哪 —— 比如"均值 H=25"就说明窗口该往橙红挪，"均值 H=215"说明 `BUCKET_HUE_MIN`
-/// 放窄了。**它故意不走 `chroma_excludes_target` 那道早退**：那道是给"当前目标色"
-/// 用的，而标定恰恰要知道"当前目标色之外还有什么颜色"。
+/// 落在哪 —— 比如"均值 H=25"就说明该把 `bucket_color` 换成 `red`，"均值 H=215"
+/// 却报 not found 说明 `blue` 的窗口漏了它。**它故意不走早退那道判据**：那道是给
+/// "当前目标色"用的，而标定恰恰要知道"当前目标色之外还有什么颜色"。
 ///
 /// 用法是把桶怼近相机再跑 `capture --bucket`：均值会被画面里所有饱和色一起拉动，
 /// 桶占满画面时才等于桶的颜色。它只用来读数定阈值，不参与控制。
 ///
-/// 注意均值是跨 0/360 卷绕取的：目标色（蓝，240）离接缝远，量蓝色很准；
-/// 若改回红色（0/360 正好是接缝）这里会被拉偏，只能当粗参考。
+/// 注意均值是跨 0/360 卷绕取的：蓝色（240）离接缝远，量蓝色很准；
+/// 红色（0/360 正好是接缝）会被拉偏，只能当粗参考。
 pub fn bucket_color_stats(
     frame: &[u8],
     width: i32,
@@ -238,13 +253,14 @@ pub fn bucket_color_stats(
         return None;
     }
     let w = width as usize;
+    // 和检测器用同一条 S/V 下限(取自目标色预设),只是**不卡色相** —— 这正是标定要看的
+    // 东西:被阈值卡掉的那些像素到底是什么色相。
+    let preset = target_color();
     let (mut hs, mut ss, mut vs, mut n) = (0i64, 0i64, 0i64, 0usize);
     for cy in 0..layout.ch as usize {
         for cx in 0..layout.cw as usize {
             let (h, s, v) = sample_hsv(frame, w, &layout, cx, cy);
-            // 和 is_target_hue 用同一条饱和度/亮度下限，只是**不卡色相** ——
-            // 这正是标定要看的东西:阈值卡掉的那些像素到底是什么色相。
-            if s < 80 || v < 50 {
+            if s < preset.min_sat || v < preset.min_val {
                 continue;
             }
             hs += h as i64;
@@ -290,32 +306,25 @@ fn sample_hsv(
     rgb2hsv(r, g, b)
 }
 
-/// 该采样点的 Cb 是否低到不可能是目标色（蓝）。
-///
-/// 无损早退：蓝色（H∈[180,300)）对应 `rgb2hsv` 里 `cmax == B` 那一支，而
-/// cmax == B 时 `Cb - 128 = 0.5B - 0.169R - 0.331G ≥ 0` 恒成立（最坏情况 R=G=B，
-/// 那是灰、S=0，本来就过不了判据）。所以 Cb 明显低于 128 的像素（绿/红/黄背景）
-/// 一定不是蓝，不必走完 RGB→HSV。120 是给定点换算留的舍入余量。
-///
-/// **改颜色时这条要跟着改**：红色看 Cr（V 平面）、蓝色看 Cb（U 平面）。
-/// 判据改错不会漏检（只是丢掉早退、变慢），但会白跑全路径。
-fn chroma_excludes_target(frame: &[u8], layout: &ChromaLayout, cx: usize, cy: usize) -> bool {
-    let idx = cy * layout.cw as usize + cx;
-    frame[layout.u_off + idx] < 120
-}
-
 /// 逐采样点判目标色，生成 0/1 掩膜。
 fn build_color_mask(frame: &[u8], width: i32, layout: &ChromaLayout) -> Vec<u8> {
     let w = width as usize;
+    // 早退判据和颜色判据必须来自同一份预设:各读一次配置既慢,也可能在运行期 init
+    // 之后两份对不上,变成"早退按蓝、判据按红"。
+    let preset = target_color();
     let mut mask = vec![0u8; layout.sample_count()];
     for cy in 0..layout.ch as usize {
         for cx in 0..layout.cw as usize {
-            if chroma_excludes_target(frame, layout, cx, cy) {
+            let idx = cy * layout.cw as usize + cx;
+            if preset
+                .guard
+                .excludes(frame[layout.u_off + idx], frame[layout.v_off + idx])
+            {
                 continue;
             }
             let (h, s, v) = sample_hsv(frame, w, layout, cx, cy);
-            if is_target_hue(h, s, v) {
-                mask[cy * layout.cw as usize + cx] = 1;
+            if preset.matches(h, s, v) {
+                mask[idx] = 1;
             }
         }
     }
@@ -340,7 +349,7 @@ fn clamp_u8(v: i32) -> u8 {
 
 /// RGB → HSV，**逐字照搬参考**（`test_cmds.cpp:470-488`），包括两个怪癖：
 /// 红区的取模 `(G-B) % (delta*6)`，以及负色相 `+360` 回绕后**先转 int 再返回**。
-/// 它不是教科书写法，但阈值是针对它的输出调出来的 —— 改了它，`is_target_hue` 的边界就挪了。
+/// 它不是教科书写法，但阈值是针对它的输出调出来的 —— 改了它，`color_preset` 里的窗口就挪了。
 fn rgb2hsv(r: u8, g: u8, b: u8) -> (i32, i32, i32) {
     let (r, g, b) = (r as i32, g as i32, b as i32);
     let cmax = r.max(g).max(b);
@@ -364,33 +373,127 @@ fn rgb2hsv(r: u8, g: u8, b: u8) -> (i32, i32, i32) {
     (h as i32, s, v)
 }
 
-/// 目标颜色的色相窗口（闭区间）。在这个 `rgb2hsv` 约定下：
-/// 红=0/360、黄=60、绿=120、青=180、纯蓝=240、品红=300。
-///
-/// **别按"240 两边各放 20"来取**。这个约定下 R=0 时 `H = 60×(4 - G/B)`，
-/// 只要蓝里带一点绿，色相就往下漂 —— 真实的蓝桶（深蓝 R=0/G=90/B=170）落在 208，
-/// 浅蓝 (100,160,220) 落在 210，紫蓝 (80,60,200) 才到 248。取 [220,260] 会把
-/// 最常见的几种蓝全漏掉。
-///
-/// 所以用 OpenCV 惯例的蓝色区间：0-180 制的 H∈[100,130]，换算到本约定就是 [200,260]。
-/// 它覆盖上述所有蓝，同时把青(180)挡在外面。
-///
-/// 对着真桶用 `akars capture --bucket` 读实际 H（会打 `mean H=..`）再定窗口。
-pub const BUCKET_HUE_MIN: i32 = 200;
-pub const BUCKET_HUE_MAX: i32 = 260;
+// ── 目标色预设 ──────────────────────────────────────────────────────────
+//
+// 色相/饱和度这些数值**只出现在这张表里**:配置文件只写颜色名
+// (`[bucket] bucket_color = "blue"`),`config::BucketColor` 到这里查判据。
+//
+// 本仓 `rgb2hsv` 约定:红=0/360、黄=60、绿=120、青=180、纯蓝=240、品红=300。
+// 三种颜色的 S/V 下限都沿用参考的 S≥80、V≥50。
 
-/// 目标色判据：饱和度/亮度下限 + 色相落在窗口内。下限沿用参考（S≥80, V≥50）。
-///
-/// 注意窗口形式是"直窗口"，因为蓝色（240）离 0/360 接缝足够远。
-/// **若改回红色，必须写成回绕形式**（`h <= 20 || h >= 340`）——红色正好横跨接缝，
-/// 用直窗口 [340, 20] 会一个字都匹配不上。
-///
-/// 网球（H 约 55~70）安全落在蓝窗之外 —— "手里夹着的那颗球"不可能被当成桶。
-fn is_target_hue(h: i32, s: i32, v: i32) -> bool {
-    if s < 80 || v < 50 {
-        return false;
+/// 一种目标色的完整判据。
+#[derive(Clone, Copy, Debug)]
+pub struct ColorPreset {
+    /// 颜色名,与 TOML 取值一致(日志用)。
+    pub name: &'static str,
+    /// 窗口一端:不跨接缝时是下界;跨接缝(`wrap`)时是贴着 360 那一段的起点。
+    pub hue_min: i32,
+    /// 窗口另一端:不跨接缝时是上界;跨接缝时是贴着 0 那一段的终点。
+    pub hue_max: i32,
+    /// 窗口是否横跨 0/360 接缝(红)。
+    pub wrap: bool,
+    /// 饱和度下限(0~255)。
+    pub min_sat: i32,
+    /// 亮度下限(0~255)。
+    pub min_val: i32,
+    /// 无损早退:哪个色度平面低到阈值以下就一定不是这个颜色。
+    guard: ChromaGuard,
+}
+
+impl ColorPreset {
+    /// `(h, s, v)` 是否落在目标色窗口内。
+    fn matches(&self, h: i32, s: i32, v: i32) -> bool {
+        if s < self.min_sat || v < self.min_val {
+            return false;
+        }
+        if self.wrap {
+            h >= self.hue_min || h <= self.hue_max
+        } else {
+            (self.hue_min..=self.hue_max).contains(&h)
+        }
     }
-    (BUCKET_HUE_MIN..=BUCKET_HUE_MAX).contains(&h)
+
+    /// 色相窗口的可读形式(日志用):跨接缝时写成两段。
+    pub fn hue_window_label(&self) -> String {
+        if self.wrap {
+            format!("H≥{} 或 H≤{}", self.hue_min, self.hue_max)
+        } else {
+            format!("H∈[{},{}]", self.hue_min, self.hue_max)
+        }
+    }
+}
+
+/// 单平面色度早退判据:那个平面的值低于阈值就一定不是目标色。
+///
+/// 它是**无损**的(写错只会丢早退、变慢,不会漏检),所以按色相的主通道挑一项就够:
+/// 蓝色时 `cmax == B`,而 `Cb - 128 = 0.5B - 0.169R - 0.331G ≥ 0` 恒成立(最坏情况
+/// R=G=B 是灰、S=0,本来就过不了判据),所以 Cb 明显低于 128 的像素(绿/红/黄背景)
+/// 一定不是蓝;120 是给定点换算留的舍入余量。红看 Cr(V 平面),对称。
+/// 绿/青的 U、V 会同时越过 128(H 越靠青 U 越高),没有单平面判据,只能走全路径。
+#[derive(Clone, Copy, Debug)]
+enum ChromaGuard {
+    /// U(Cb) 低于此值 → 不是目标色。
+    LowU(u8),
+    /// V(Cr) 低于此值 → 不是目标色。
+    LowV(u8),
+    /// 没有单平面判据。
+    None,
+}
+
+impl ChromaGuard {
+    fn excludes(self, u: u8, v: u8) -> bool {
+        match self {
+            ChromaGuard::LowU(limit) => u < limit,
+            ChromaGuard::LowV(limit) => v < limit,
+            ChromaGuard::None => false,
+        }
+    }
+}
+
+/// 颜色名 → 判据。加一种颜色只加一个分支、一行测试。
+fn color_preset(color: config::BucketColor) -> ColorPreset {
+    match color {
+        // 蓝窗**别按"240 两边各放 20"来取**。这个约定下 R=0 时 `H = 60×(4 - G/B)`,
+        // 只要蓝里带一点绿,色相就往下漂 —— 真实的蓝桶(深蓝 R=0/G=90/B=170)落在 208,
+        // 浅蓝 (100,160,220) 落在 210,紫蓝 (80,60,200) 才到 248;取 [220,260] 会把最
+        // 常见的几种蓝全漏掉。所以用 OpenCV 惯例的蓝色区间:0-180 制的 H∈[100,130],
+        // 换算到本约定就是 [200,260] —— 盖住上述所有蓝,同时把青(180)挡在外面。
+        config::BucketColor::Blue => ColorPreset {
+            name: "blue",
+            hue_min: 200,
+            hue_max: 260,
+            wrap: false,
+            min_sat: 80,
+            min_val: 50,
+            guard: ChromaGuard::LowU(120),
+        },
+        // 红色正好横跨 0/360 接缝:直窗口 [340,20] 会一个字都匹配不上,必须回绕。
+        config::BucketColor::Red => ColorPreset {
+            name: "red",
+            hue_min: 340,
+            hue_max: 20,
+            wrap: true,
+            min_sat: 80,
+            min_val: 50,
+            guard: ChromaGuard::LowV(120),
+        },
+        // 绿窗居中于 120:上界 160 把青(180)挡在外面,下界 80 与网球的黄绿(55~70)
+        // 留出间隔 —— 手里夹着的那颗球不会被当成桶。
+        config::BucketColor::Green => ColorPreset {
+            name: "green",
+            hue_min: 80,
+            hue_max: 160,
+            wrap: false,
+            min_sat: 80,
+            min_val: 50,
+            guard: ChromaGuard::None,
+        },
+    }
+}
+
+/// 当前配置的目标色判据。`capture --bucket` 用它打印"按什么判"。
+pub fn target_color() -> ColorPreset {
+    color_preset(config::get().bucket.bucket_color)
 }
 
 /// 两遍扫描 + 并查集的 4-连通域标记，照搬参考 `test_cmds.cpp:497-576`。
@@ -502,23 +605,32 @@ fn uf_find(parent: &mut [i32], mut x: usize) -> usize {
 /// `[chassis] turn_reverse`：轮子通道与物理左右反接的底盘用它把差速镜像，
 /// 使修正朝物理上正确的一侧；死区/幅值/速度档与极性无关。
 fn bucket_approach_command(area_ratio: f32, cx: i32, half_w: i32, polarity: i32) -> (i32, i32) {
+    let cfg = config::get().bucket;
+    let (approach_spd, brake_spd) = approach_speeds(&cfg);
     let half_w = half_w.max(1);
     let off = cx - half_w;
-    let bias = if off.abs() <= BUCKET_CENTER_DEAD_ZONE {
+    let bias = if off.abs() <= cfg.center_dead_zone {
         0
     } else {
-        (BUCKET_K_TURN * off as f32 / half_w as f32) as i32
+        (cfg.k_turn * off as f32 / half_w as f32) as i32
     };
-    let bias = bias.clamp(-BUCKET_MAX_BIAS, BUCKET_MAX_BIAS) * polarity;
-    let spd = if area_ratio >= BUCKET_AREA_BRAKE {
-        BUCKET_BRAKE_SPD
+    let bias = bias.clamp(-cfg.max_bias, cfg.max_bias) * polarity;
+    let spd = if area_ratio >= cfg.area_brake {
+        brake_spd
     } else {
-        BUCKET_APPROACH_SPD
+        approach_spd
     };
     ((spd + bias).clamp(-100, 100), (spd - bias).clamp(-100, 100))
 }
 
 // ── 状态机 ────────────────────────────────────────────────────────────────
+
+/// 放球后的倒退时长 → 目的地相。`ms = 0` 表示不退，直接收工（旧行为）。
+fn deposit_backoff_phase(ms: u64, now: Instant) -> Option<BucketPhase> {
+    (ms > 0).then(|| BucketPhase::Backoff {
+        until: now + Duration::from_millis(ms),
+    })
+}
 
 /// 一帧的只读视图，打包成**一个**参数。
 ///
@@ -554,8 +666,10 @@ pub enum BucketPhase {
     Braking { until: Instant },
     /// 已松爪，等舵机走完再把机械臂归位。
     DepositRelease { until: Instant },
-    /// 机械臂归位中，之后放行回追球。
+    /// 机械臂归位中，之后放球尾部结束。
     DepositHome { until: Instant },
+    /// 归位后倒退一小段，把车头从桶边挪开，然后交还追球。
+    Backoff { until: Instant },
 }
 
 /// 桶流程的全部状态。必须保持 `Copy` —— `RobotState` 依赖它。
@@ -606,6 +720,17 @@ impl BucketTrack {
         self.lost = 0;
     }
 
+    /// 收尾：清干净状态并把控制权交回追球。
+    fn finish(&mut self) -> BucketOutcome {
+        self.phase = BucketPhase::Idle;
+        self.confirm = 0;
+        self.lost = 0;
+        if bucket_log() {
+            eprintln!("[bucket] done -> back to chase");
+        }
+        BucketOutcome::Finished
+    }
+
     /// 推进一帧。`frame` 是拷贝路径(ioctl 4)拿到的平面 YUV 原始字节 ——
     /// 相机 I/O 留在调用方，这里只吃字节，所以单测能直接喂合成帧。
     pub fn step(
@@ -616,6 +741,8 @@ impl BucketTrack {
         now: Instant,
     ) -> BucketOutcome {
         let (width, height, planar) = (frame.width, frame.height, frame.planar);
+        // 本帧的桶参数快照（全局配置是 Copy，逐帧取一次即可）。
+        let cfg = config::get().bucket;
         match self.phase {
             BucketPhase::Idle => BucketOutcome::Finished,
 
@@ -628,7 +755,7 @@ impl BucketTrack {
                 motor.standby();
                 arm.release();
                 self.phase = BucketPhase::DepositRelease {
-                    until: now + Duration::from_millis(BUCKET_DEPOSIT_MS),
+                    until: now + Duration::from_millis(cfg.deposit_ms),
                 };
                 if bucket_log() {
                     eprintln!("[bucket] deposit: braking done, released ball");
@@ -643,7 +770,7 @@ impl BucketTrack {
                 }
                 arm.grab_pos();
                 self.phase = BucketPhase::DepositHome {
-                    until: now + Duration::from_millis(BUCKET_HOME_MS),
+                    until: now + Duration::from_millis(cfg.home_ms),
                 };
                 BucketOutcome::Busy
             }
@@ -653,23 +780,37 @@ impl BucketTrack {
                 if now < until {
                     return BucketOutcome::Busy;
                 }
-                self.phase = BucketPhase::Idle;
-                self.confirm = 0;
-                self.lost = 0;
-                if bucket_log() {
-                    eprintln!("[bucket] done -> back to chase");
+                // 球已落进桶,车头还贴着桶壁:先倒一小段再交还追球。不然下一步
+                // “没看到球 → 原地旋转搜索”就在桶鼻子上打转,车身扫过去就蹭上了。
+                match deposit_backoff_phase(cfg.deposit_backoff_ms, now) {
+                    Some(phase) => self.phase = phase,
+                    None => return self.finish(),
                 }
-                BucketOutcome::Finished
+                BucketOutcome::Busy
+            }
+
+            BucketPhase::Backoff { until } => {
+                // 只求离开桶:整段保持倒车速度,到点刹车交还追球。按帧定时,
+                // 差一帧的位移无所谓 —— 这里不需要抓球后退脉冲那种“退准”。
+                if now < until {
+                    motor.backward(config::get().chassis.backward_speed);
+                    return BucketOutcome::Busy;
+                }
+                motor.brake();
+                if bucket_log() {
+                    eprintln!("[bucket] deposit: backed off, handing back to chase");
+                }
+                self.finish()
             }
 
             BucketPhase::Find => {
-                match detect_bucket(frame.pixels, width, height, planar, BUCKET_MIN_AREA_FULLRES) {
+                match detect_bucket(frame.pixels, width, height, planar, cfg.min_area_fullres) {
                     Some(r) => {
                         self.confirm += 1;
                         self.lost = 0;
                         // 确认期内站定不动，别边转边确认。
                         motor.standby();
-                        if self.confirm >= BUCKET_CONFIRM_CNT {
+                        if self.confirm >= cfg.confirm_frames {
                             self.phase = BucketPhase::Approaching;
                             self.confirm = 0;
                             if bucket_log() {
@@ -681,7 +822,7 @@ impl BucketTrack {
                         } else if bucket_log() {
                             eprintln!(
                                 "[bucket] find: seen {}/{} area={:.3}",
-                                self.confirm, BUCKET_CONFIRM_CNT, r.area_ratio
+                                self.confirm, cfg.confirm_frames, r.area_ratio
                             );
                         }
                     }
@@ -691,7 +832,7 @@ impl BucketTrack {
                         // 参考固定右转；不按"最后看到的一侧"回摆，因为桶可能从未出现过。
                         // 轮速过极性镜像后，日志里的"右转"始终指物理右转，与丢球搜索一致。
                         let p = turn_polarity();
-                        motor.drive(p * BUCKET_SEARCH_SPD, -p * BUCKET_SEARCH_SPD);
+                        motor.drive(p * cfg.search_speed, -p * cfg.search_speed);
                         if bucket_log() {
                             eprintln!("[bucket] find: searching right, lost={}", self.lost);
                         }
@@ -701,10 +842,10 @@ impl BucketTrack {
             }
 
             BucketPhase::Approaching => {
-                match detect_bucket(frame.pixels, width, height, planar, BUCKET_MIN_AREA_FULLRES) {
+                match detect_bucket(frame.pixels, width, height, planar, cfg.min_area_fullres) {
                     None => {
                         self.lost += 1;
-                        if self.lost > BUCKET_LOST_FRAMES {
+                        if self.lost > cfg.lost_frames {
                             self.phase = BucketPhase::Find;
                             self.confirm = 0;
                             motor.standby();
@@ -713,23 +854,20 @@ impl BucketTrack {
                             motor.standby();
                         }
                         if bucket_log() {
-                            eprintln!(
-                                "[bucket] approach: lost {}/{}",
-                                self.lost, BUCKET_LOST_FRAMES
-                            );
+                            eprintln!("[bucket] approach: lost {}/{}", self.lost, cfg.lost_frames);
                         }
                     }
                     Some(r) => {
                         self.lost = 0;
-                        if r.area_ratio >= BUCKET_AREA_DEPOSIT {
+                        if r.area_ratio >= cfg.area_deposit {
                             self.phase = BucketPhase::Braking {
-                                until: now + Duration::from_millis(BUCKET_BRAKE_MS),
+                                until: now + Duration::from_millis(cfg.brake_ms),
                             };
                             motor.brake();
                             if bucket_log() {
                                 eprintln!(
                                     "[bucket] area={:.3} -> brake {}ms",
-                                    r.area_ratio, BUCKET_BRAKE_MS
+                                    r.area_ratio, cfg.brake_ms
                                 );
                             }
                         } else {
@@ -781,8 +919,8 @@ mod tests {
         )
     }
 
-    /// 测试用的"桶"颜色：纯蓝（H=240，落在 `BUCKET_HUE_MIN..=MAX` 正中）。
-    /// 换目标色时改这里和 `is_target_hue` 的窗口，其余测试跟着走。
+    /// 测试用的"桶"颜色：纯蓝（H=240，落在 blue 窗正中）。
+    /// 换目标色时改这里和 `color_preset` 的预设表，其余测试跟着走。
     const TEST_BUCKET_RGB: (u8, u8, u8) = (0, 0, 255);
 
     /// 造一帧平面 YUV：灰底 + 若干纯目标色矩形（全分辨率坐标，必须偶数对齐，
@@ -847,21 +985,68 @@ mod tests {
         assert!(s > 0 && v == 200);
     }
 
+    /// 蓝窗边界必须是闭的，且不许把色相环上的邻居放进来。
     #[test]
-    fn target_hue_boundaries_match_the_window() {
+    fn blue_window_boundaries_match() {
         // 窗口 [200, 260]，门槛 S≥80、V≥50。
-        assert!(is_target_hue(BUCKET_HUE_MIN, 80, 50), "闭区间左端");
-        assert!(is_target_hue(BUCKET_HUE_MAX, 80, 50), "闭区间右端");
-        assert!(!is_target_hue(BUCKET_HUE_MIN - 1, 255, 255), "左端外一点");
-        assert!(!is_target_hue(BUCKET_HUE_MAX + 1, 255, 255), "右端外一点");
-        assert!(!is_target_hue(240, 79, 255), "S 差一点");
-        assert!(!is_target_hue(240, 255, 49), "V 差一点");
+        let blue = color_preset(config::BucketColor::Blue);
+        assert!(blue.matches(blue.hue_min, 80, 50), "闭区间左端");
+        assert!(blue.matches(blue.hue_max, 80, 50), "闭区间右端");
+        assert!(!blue.matches(blue.hue_min - 1, 255, 255), "左端外一点");
+        assert!(!blue.matches(blue.hue_max + 1, 255, 255), "右端外一点");
+        assert!(!blue.matches(240, 79, 255), "S 差一点");
+        assert!(!blue.matches(240, 255, 49), "V 差一点");
         // 色相环上的非蓝邻居一个都不许漏进来。青(180)是左边界最近的那个。
         for h in [0, 60, 120, 180, 190, 270, 300, 340] {
-            assert!(!is_target_hue(h, 255, 255), "H={h} 不该被判成桶");
+            assert!(!blue.matches(h, 255, 255), "H={h} 不该被判成桶");
         }
-        // 网球是黄绿(H≈55~70)—— 手里夹着的那颗球永远不会被判成桶。
-        assert!(!is_target_hue(60, 255, 255));
+    }
+
+    /// 红窗横跨 0/360 接缝，必须写成回绕形式:直窗口 `[340,20]` 会一个字都匹配不上。
+    #[test]
+    fn red_window_wraps_across_the_hue_seam() {
+        let red = color_preset(config::BucketColor::Red);
+        assert!(red.wrap);
+        for h in [340, 350, 359, 0, 10, 20] {
+            assert!(red.matches(h, 255, 255), "红窗该收下 H={h}");
+        }
+        for h in [30, 60, 120, 200, 240, 300, 330] {
+            assert!(!red.matches(h, 255, 255), "红窗不该收 H={h}");
+        }
+    }
+
+    /// 无论选哪个颜色，网球（黄绿 H≈55~70）都不许被判成桶 —— 否则追桶循环会把
+    /// 手里夹着的那颗球当成目标。
+    #[test]
+    fn no_preset_takes_the_tennis_ball_for_a_bucket() {
+        for color in [
+            config::BucketColor::Blue,
+            config::BucketColor::Red,
+            config::BucketColor::Green,
+        ] {
+            let preset = color_preset(color);
+            for h in 50..=75 {
+                assert!(
+                    !preset.matches(h, 255, 255),
+                    "{} 把网球 H={h} 当桶了",
+                    preset.name
+                );
+            }
+        }
+    }
+
+    /// 早退只能让进算更快，不许挡住真正的目标色。
+    #[test]
+    fn chroma_guard_never_hides_the_target_colour() {
+        let blue = color_preset(config::BucketColor::Blue);
+        let (_, u, _) = rgb_to_yuv601(0, 90, 170);
+        assert!(!blue.guard.excludes(u, 128), "深蓝桶被 U 早退挡掉了");
+        let red = color_preset(config::BucketColor::Red);
+        let (_, _, v) = rgb_to_yuv601(200, 30, 30);
+        assert!(!red.guard.excludes(128, v), "红桶被 V 早退挡掉了");
+        // 绿色没有单平面判据，任何色度值都不许早退。
+        let green = color_preset(config::BucketColor::Green);
+        assert!(!green.guard.excludes(255, 255));
     }
 
     /// 窗口必须盖住**真实的蓝**，不是只盖住"纯蓝"。这个约定下 R=0 时
@@ -882,7 +1067,10 @@ mod tests {
         for ((r, g, b), expect) in realistic_blues {
             let (h, s, v) = rgb2hsv(r, g, b);
             assert_eq!(h, expect, "({r},{g},{b}) 的色相遇算计有变");
-            assert!(is_target_hue(h, s, v), "({r},{g},{b}) H={h} 应被判成蓝");
+            assert!(
+                color_preset(config::BucketColor::Blue).matches(h, s, v),
+                "({r},{g},{b}) H={h} 应被判成蓝"
+            );
         }
     }
 
@@ -1133,6 +1321,31 @@ mod tests {
         assert_eq!(bucket_approach_command(0.1, 0, half, 1), (17, 33));
     }
 
+    /// 两级趋近速度的护栏:低于"推得动整车"下限的取值被抬到下限,制动档不超过
+    /// 趋近档 —— 否则制动区里车原地不动,面积不再涨,永远卡在 area_brake~area_deposit。
+    #[test]
+    fn approach_speeds_clamp_to_the_moving_threshold() {
+        let mut cfg = config::BucketConfig::default();
+        // 参考的制动档 5:抬到下限,但仍不高于趋近档。
+        cfg.approach_speed = 25;
+        cfg.brake_speed = 5;
+        assert_eq!(approach_speeds(&cfg), (25, MIN_MOVING_SPEED));
+
+        // 连趋近档都低于下限:两档一起抬到下限。
+        cfg.approach_speed = 10;
+        cfg.brake_speed = 22;
+        assert_eq!(approach_speeds(&cfg), (MIN_MOVING_SPEED, MIN_MOVING_SPEED));
+
+        // 制动档反而比趋近档快:压回趋近档(两级退化成一级,至少不会越靠近越快)。
+        cfg.approach_speed = 30;
+        cfg.brake_speed = 40;
+        assert_eq!(approach_speeds(&cfg), (30, 30));
+
+        // 默认值原样通过 —— 护栏不应悄悄改掉标定值。
+        let d = config::BucketConfig::default();
+        assert_eq!((d.approach_speed, d.brake_speed), approach_speeds(&d));
+    }
+
     /// `[chassis] turn_reverse` 的极性只镜像差速修正，死区/幅值/速度档不变，
     /// 与追球/丢球搜索共用同一份接线补偿。
     #[test]
@@ -1339,11 +1552,38 @@ mod tests {
         };
         assert_eq!(t3 - t2, Duration::from_millis(BUCKET_HOME_MS));
 
-        // 归位等够 → 收工,状态清干净。
-        assert_eq!(rig.step(&bucket_frame(), t3), BucketOutcome::Finished);
+        // 归位等够 → 倒退一小段(按帧定时,和其它段同一套写法)。
+        rig.step(&bucket_frame(), t3);
+        let BucketPhase::Backoff { until: t4 } = rig.track.phase() else {
+            panic!("期望 Backoff,实得 {:?}", rig.track.phase());
+        };
+        assert_eq!(t4 - t3, Duration::from_millis(BUCKET_DEPOSIT_BACKOFF_MS));
+        // 倒退期间还没收工(控制权还在桶流程手里)。
+        assert_eq!(
+            rig.step(&bucket_frame(), t4 - Duration::from_millis(1)),
+            BucketOutcome::Busy
+        );
+
+        // 倒退到点 → 收工,状态清干净。
+        assert_eq!(rig.step(&bucket_frame(), t4), BucketOutcome::Finished);
         assert!(!rig.track.is_active());
         assert_eq!(rig.track.confirm_count(), 0);
         assert_eq!(rig.track.lost_count(), 0);
+    }
+
+    /// 倒退只是“放球尾部”的一段:`deposit_backoff_ms = 0` 时不排这一段、直接收工。
+    #[test]
+    fn deposit_backoff_phase_is_skipped_when_zero() {
+        let now = Instant::now();
+        assert_eq!(deposit_backoff_phase(0, now), None);
+        assert_eq!(
+            deposit_backoff_phase(300, now),
+            Some(BucketPhase::Backoff {
+                until: now + Duration::from_millis(300)
+            })
+        );
+        // 缺省是真退,不是 0。
+        assert!(config::BucketConfig::default().deposit_backoff_ms > 0);
     }
 
     #[test]
