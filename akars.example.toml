@@ -30,18 +30,24 @@ idle_speed = 25               # 丢球后原地慢转搜索速度
 backward_speed = 30           # 太近时的后退速度
 turn_reverse = false           # 全局转向极性:轮子通道与物理左右反接时置 true,同时纠正追球/搜索/追桶(正常接线用 false;抓取盲转方向看 grab_turn_direction)
 
-# ── 抓取状态机:距离阈值、确认帧数、各段时长 ──
+# ── 抓取状态机:距离阈值、确认驻留时长、各段时长 ──
 [grab]
-grab_area = 0.25               # “够近可抓”的面积阈值
-grab_area_max = 0.26           # “太近了、先后退”的面积阈值,须大于 grab_area
+# 距离阈值是球框面积占“原始相机画面”的比例(推理用的 640x480 补边在算面积前已映射回原帧)。
+# 同一球尺寸下近似满足 z ≈ k/√面积,k 逐车标定(方法见 README “Calibrating grab distances”)。
+# 触发 grab_area 后车还会滑行几厘米才下爪,engage 距离应比理想下爪距离远一个滑行量。
+# 球底贴出画面底边(球出镜头)时,面积读数失真,代码会无条件刹车后退脱离,无需配置。
+grab_area = 0.25               # “够近可抓”的面积阈值(比较的是 EMA 滤波后的面积比)
+grab_area_max = 0.26           # “太近了、先后退”的面积阈值,须大于 grab_area;相等=每次抓取起手都先退再复判
 grab_turn_count = 2            # 抓取前盲转微调次数(补偿爪子偏心)
 grab_turn_speed = 35           # 盲转微调速度(与 grab_turn_ms 成对标定)
 grab_turn_direction = "right"  # 盲转方向:left 左转 / right 右转,按爪子相对相机的偏心方向选(逐车不同)
-grab_confirm_threshold = 5     # 连续满足“够近且居中”的确认帧数
+area_filter_alpha = 0.4        # 面积比 EMA 系数(0~1):越小越平滑,单帧框抖动不直接碰阈值线
+grab_hysteresis_frac = 0.1     # “够近”触发线的滞回带宽(占 grab_area 比例):带内抖动不清驻留计时
+grab_confirm_ms = 300          # “够近且居中”驻留时长(ms);旧 grab_confirm_threshold 帧数口径已废弃
 lost_grace_frames = 8          # 丢失宽限帧数,超过才判定真丢
-grab_backoff_ms = 200          # 太近时后退时长
-grab_turn_ms = 250             # 每次盲转微调时长
-grab_turn_gap_ms = 100         # 两次盲转之间的停稳间隔
+grab_backoff_ms = 200          # 太近时后退时长(墙钟定时跑满,结束后有静止观测窗)
+grab_turn_ms = 250             # 每次盲转微调时长(墙钟定时,与相机帧节奏无关)
+grab_turn_gap_ms = 100         # 两次盲转之间的停稳间隔(段末主动刹车)
 grab_close_ms = 200            # 闭爪后等待伺服到位
 grab_release_ms = 100          # 松开后等待伺服到位
 grab_home_ms = 100             # 归位后回到追球前的等待

@@ -57,6 +57,16 @@ struct ArmTestCli {
     config: PathBuf,
 }
 
+/// Arguments for the direct chassis test: drive/brake/reverse phases through
+/// the same `Motor::open` handshake the hunter uses, so wheel direction can
+/// be observed without the camera/TPU pipeline.
+#[derive(Debug)]
+struct MotorTestCli {
+    motor: String,
+    speed: i32,
+    config: PathBuf,
+}
+
 #[derive(Debug)]
 enum Command {
     Hunt(Cli),
@@ -64,6 +74,7 @@ enum Command {
     Detect(DetectCli),
     Capture(CaptureCli),
     ArmTest(ArmTestCli),
+    MotorTest(MotorTestCli),
 }
 
 impl Default for Cli {
@@ -148,6 +159,7 @@ fn main() {
         Command::Detect(cli) => run_detect(cli),
         Command::Capture(cli) => run_capture(cli),
         Command::ArmTest(cli) => run_armtest(cli),
+        Command::MotorTest(cli) => run_motortest(cli),
     }
 }
 
@@ -169,6 +181,91 @@ fn run_armtest(cli: ArmTestCli) {
     eprintln!(
         "[armtest] sent: servo0={:.1} servo1={:.1} servo2={:.1} time_ms={}",
         cli.servo0, cli.servo1, cli.servo2, time_ms
+    );
+}
+
+fn run_motortest(cli: MotorTestCli) {
+    use std::time::{Duration, Instant};
+
+    config::init(config::load(&cli.config));
+    let motor_file = config::get().motor;
+    let motor_config = MotorConfig {
+        device: cli.motor.clone(),
+        speed_scale: motor_file.speed_scale,
+        min_speed: motor_file.min_speed,
+        ppr: motor_file.ppr,
+        pwm_freq: motor_file.pwm_freq,
+    };
+    let mut motor = match Motor::open(&motor_config) {
+        Ok(motor) => motor,
+        Err(err) => {
+            eprintln!("[motortest] failed to open {}: {err}", cli.motor);
+            std::process::exit(1);
+        }
+    };
+
+    let speed = cli.speed.clamp(1, 100);
+    // 每 100ms 重发目标转速(与主循环同模式):ESP32 锁存目标值,重发只是保险,
+    // 同时避开“发一次就被看门狗/自动复位吐掉”的歧义。相位名先打出来,方便
+    // 盯轮子的人对齐时间轴报现象。
+    let phases: [(&str, Duration); 4] = [
+        ("FORWARD", Duration::from_secs(2)),
+        ("BRAKE", Duration::from_secs(1)),
+        ("BACKWARD", Duration::from_secs(2)),
+        ("STOP", Duration::from_millis(300)),
+    ];
+    for (label, dur) in phases {
+        eprintln!(
+            "[motortest] PHASE_{label} speed={speed} for {}ms",
+            dur.as_millis()
+        );
+        let until = Instant::now() + dur;
+        while Instant::now() < until {
+            match label {
+                "FORWARD" => motor.drive(speed, speed),
+                "BRAKE" => motor.brake(),
+                "BACKWARD" => motor.drive(-speed, -speed),
+                _ => motor.standby(),
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    eprintln!("[motortest] done; sending CMD_RESET via drop");
+}
+
+fn parse_motortest_cli(args: impl Iterator<Item = String>) -> Result<MotorTestCli, String> {
+    let mut cli = MotorTestCli {
+        motor: "/dev/ttyS1".to_string(),
+        speed: 20,
+        config: PathBuf::from(DEFAULT_CONFIG_PATH),
+    };
+    let mut args = args.peekable();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_motortest_usage();
+                std::process::exit(0);
+            }
+            "--motor" => cli.motor = take_value(&mut args, "--motor")?,
+            "--config" => cli.config = PathBuf::from(take_value(&mut args, "--config")?),
+            "--speed" => {
+                cli.speed = take_value(&mut args, "--speed")?
+                    .parse()
+                    .map_err(|_| "--speed expects an integer (1..100)".to_string())?;
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown motortest option: {value}"));
+            }
+            value => return Err(format!("unexpected motortest argument: {value}")),
+        }
+    }
+    Ok(cli)
+}
+
+fn print_motortest_usage() {
+    eprintln!(
+        "Usage: akars motortest [--motor DEV] [--speed N] [--config PATH]\n\nRuns timed drive/brake/reverse phases straight through the motor protocol\nso wheel direction can be observed with the car lifted. The car MOVES if\nit is on the ground: lift the wheels first.\n\nDefaults:\n  --motor /dev/ttyS1\n  --speed 20\n  --config /root/akars.toml"
     );
 }
 
@@ -401,6 +498,10 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Command, String> {
             args.next();
             parse_armtest_cli(args).map(Command::ArmTest)
         }
+        Some("motortest") => {
+            args.next();
+            parse_motortest_cli(args).map(Command::MotorTest)
+        }
         _ => parse_hunt_cli(args).map(Command::Hunt),
     }
 }
@@ -623,7 +724,7 @@ fn take_value(
 
 fn print_usage() {
     eprintln!(
-        "Usage:\n  akars <model.cvimodel> [--camera DEV] [--motor DEV] [--arm DEV] [--config PATH] [--frames N] [--classes N] [--conf X] [--iou X]\n  akars serve [--listen HOST:PORT] [--motor DEV] [--arm DEV] [--config PATH] [--mock]\n  akars detect <model.cvimodel> <image> [--out PATH] [--classes N] [--conf X] [--iou X]\n  akars capture [output.jpg] [--camera DEV] [--out PATH] [--warmup N]\n  akars armtest <servo0> <servo1> <servo2> [--arm DEV] [--time MS] [--config PATH]"
+        "Usage:\n  akars <model.cvimodel> [--camera DEV] [--motor DEV] [--arm DEV] [--config PATH] [--frames N] [--classes N] [--conf X] [--iou X]\n  akars serve [--listen HOST:PORT] [--motor DEV] [--arm DEV] [--config PATH] [--mock]\n  akars detect <model.cvimodel> <image> [--out PATH] [--classes N] [--conf X] [--iou X]\n  akars capture [output.jpg] [--camera DEV] [--out PATH] [--warmup N]\n  akars armtest <servo0> <servo1> <servo2> [--arm DEV] [--time MS] [--config PATH]\n  akars motortest [--motor DEV] [--speed N] [--config PATH]"
     );
 }
 

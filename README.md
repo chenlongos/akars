@@ -122,11 +122,86 @@ restart the program — no rebuild needed.
   cars need to turn toward different sides to bring the ball in front of the claw,
   so this is an explicit per-car calibration value rather than something derived from
   the wiring polarity.
+- **Open-loop chassis motions are wall-clock timed, never frame-stepped.** The
+  pre-grab blind turn is `grab_turn_count` pulses of `grab_turn_ms`, separated and
+  followed by `grab_turn_gap_ms`; the back-off is one reverse pulse of
+  `grab_backoff_ms`. Both run to completion inside a single call and brake
+  immediately at the end, instead of being advanced one frame at a time. They used
+  to be stepped by the frame loop, which let the frame period (~60ms, and much
+  longer whenever the camera hiccups) quantize the pulse: the same config would
+  sometimes deliver half a pulse and sometimes sweep the whole motion in one go, so
+  the claw landed in different places and the reverse pulse occasionally backed
+  much further than intended. Braking at the end of every pulse also stops it from
+  inheriting the previous one's residual spin. The motion per grab is now
+  repeatable; retune `grab_turn_ms` / `grab_turn_count` if the claw starts stopping
+  short, since the pulses no longer carry that coast over.
+- After the back-off pulse the car stays still for a short **settle window** before
+  the distance is re-judged, so the EMA has taken in fresh post-back-off frames;
+  judging immediately would re-use the pre-back-off (too-close) reading and back off
+  forever. That window never moves the chassis, so its frame-based timing cannot
+  turn into displacement.
 - `[grab] chase_bucket = true | false` decides whether a successful grab hands over
   to the "chase the blue bucket -> deposit the ball" loop (`true`, the default) or
   the claw just releases in place and the car chases the next ball (`false`).
   For quick on-car debugging the `AKARS_NO_BUCKET` environment variable force-
   disables the bucket loop without editing the config file.
+- The grab trigger compares an **EMA-filtered** ball area ratio (`[grab]
+  area_filter_alpha`) against `grab_area` with a **hysteresis band** (`[grab]
+  grab_hysteresis_frac`, a fraction of `grab_area`): jitter of the raw YOLO box
+  around the threshold line no longer resets the confirmation. The dwell is timed
+  in **milliseconds** (`[grab] grab_confirm_ms`), not frames, so the trigger
+  distance no longer depends on camera framerate. While confirming, the chassis
+  actively brakes (`CMD_BRAKE`) instead of coasting to a stop, and once engaged the
+  straight segment stops creeping forward — the car holds the distance it crossed
+  the threshold at. `grab_area_max` should stay above `grab_area`; after each
+  back-off pulse the car holds still for a settle window and then the distance is
+  re-measured from fresh frames: still too close backs off again (up to 2 retries),
+  overshot aborts back to chasing, in-band proceeds to the blind turn.
+- **Ball-out-of-frame too-close signal**: the ball bbox shows the near-clip
+  signature — its bottom edge touches the frame bottom, or the rigid-sphere box
+  comes out squashed (width − height > 20px; fully-framed boxes measure within
+  a few px, clipped ones tens) — the area readout there is clipped and no
+  longer a trustworthy distance. While the grab gate is still disengaged, that
+  signal enters the same pulse-based backoff used for "too close" at grab
+  start (one wall-clock timed reverse pulse, then a settle window and a
+  re-measure); once engaged the
+  approach is left alone — the dwell already brakes every frame and hands over
+  to the grab sequence within ~200ms, whose too-close branch owns the measured
+  back-off. Interrupting mid-dwell would cut every normal coast-in at the
+  claw's ~11cm sweet spot and loop chase↔reverse forever.
+- Migration: the old `[grab] grab_confirm_threshold` (consecutive-frame count) is
+  gone; leftover keys on a card are ignored and the dwell falls back to
+  `grab_confirm_ms` (default 300ms, ~= the old 5 frames at 17fps).
+
+### Calibrating grab distances (area ratio -> physical distance)
+
+`grab_area` and friends are ball-bbox fractions of the **raw camera frame**
+(640x360 here; the 640x480 letterbox used for inference is mapped back before
+the area is computed, so it never enters the denominator). For a ball of fixed
+physical size the area follows an inverse-square law, `a ~= (k/z)^2`, with one
+car-specific constant `k` that absorbs ball size, lens and mounting. Measure it
+with `akars capture` (or the on-screen bbox) at 2-3 known ball-center distances,
+fit `k = z*sqrt(a)`, then translate thresholds:
+
+```text
+car1 measured (k ~= 7.2-7.5 cm, valid 120cm down to ~11.5cm):
+  0.004 -> ~120cm   0.015 -> ~60cm   0.15 -> ~19cm   0.20 -> ~16cm
+  0.39 -> ~11.5cm (armtest claw sweet spot)   0.58 -> ~8.4cm (bottom clipped)
+```
+
+Pick the engage threshold from the desired claw gap: the car still coasts
+several centimeters after forward stops (brake is a coast `CMD_BRAKE`, dwell
+is ~200ms), so `engage distance ~= grab distance + coast distance`. On car1
+engage 0.20 + ~5cm coast fires the grab right at the armtest sweet spot
+(0.39 @ ~11.5cm ball-center distance, leaving roughly 3cm between bumper and
+ball). Area values above that spot are unreliable as a distance readout: once
+the ball is closer than ~11.5cm its bottom edge leaves the frame, the bbox gets
+clipped and stops following `1/z^2` (k drops from ~7.3 to ~6.4 by 0.58). Keep
+both the engage threshold and any closed-loop band below the clipping onset;
+re-check `k` per vehicle and after mounting changes; `akars motortest` verifies
+the chassis start/stop/reverse behavior the coast distance depends on, and
+`akars armtest` finds the physical claw sweet spot the engage threshold should
+land on after the coast.
 
 Test TPU inference on a single image:
 

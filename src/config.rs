@@ -16,13 +16,13 @@ use crate::arm::{
 };
 use crate::motor::MotorConfig;
 use crate::robot::{
-    BACKWARD_SPEED, BRAKE_TRAVEL_MARGIN, CENTER_MARGIN, CHASE_FAR_AREA, CHASE_MID_AREA,
-    CHASE_SPEED_FAR, CHASE_SPEED_MID, CHASE_SPEED_NEAR, CORRECT_SETTLE_MS, GRAB_AREA,
-    GRAB_AREA_MAX, GRAB_BACKOFF_MS, GRAB_CLOSE_MS, GRAB_CONFIRM_THRESHOLD, GRAB_HOME_MS,
-    GRAB_RELEASE_MS, GRAB_TURN_COUNT, GRAB_TURN_GAP_MS, GRAB_TURN_MS, GRAB_TURN_SPEED, IDLE_SPEED,
-    LANE_BREAK_PX, LOST_GRACE_FRAMES, MARGIN_PROXIMITY_GAIN, PROXIMITY_DAMP_MIN,
-    REFERENCE_FRAME_WIDTH, TURN_INPLACE_AREA, TURN_PULSE_GAIN_MS, TURN_PULSE_MAX_MS,
-    TURN_PULSE_MIN_MS, TURN_PULSE_SPEED, TURN_PULSE_SPEED_DIFF,
+    AREA_FILTER_ALPHA, BACKWARD_SPEED, BRAKE_TRAVEL_MARGIN, CENTER_MARGIN, CHASE_FAR_AREA,
+    CHASE_MID_AREA, CHASE_SPEED_FAR, CHASE_SPEED_MID, CHASE_SPEED_NEAR, CORRECT_SETTLE_MS,
+    GRAB_AREA, GRAB_AREA_MAX, GRAB_BACKOFF_MS, GRAB_CLOSE_MS, GRAB_CONFIRM_MS, GRAB_HOME_MS,
+    GRAB_HYSTERESIS_FRAC, GRAB_RELEASE_MS, GRAB_TURN_COUNT, GRAB_TURN_GAP_MS, GRAB_TURN_MS,
+    GRAB_TURN_SPEED, IDLE_SPEED, LANE_BREAK_PX, LOST_GRACE_FRAMES, MARGIN_PROXIMITY_GAIN,
+    PROXIMITY_DAMP_MIN, REFERENCE_FRAME_WIDTH, TURN_INPLACE_AREA, TURN_PULSE_GAIN_MS,
+    TURN_PULSE_MAX_MS, TURN_PULSE_MIN_MS, TURN_PULSE_SPEED, TURN_PULSE_SPEED_DIFF,
 };
 use serde::Deserialize;
 use std::path::Path;
@@ -126,7 +126,8 @@ pub enum GrabTurnDirection {
 pub struct GrabConfig {
     /// “够近可抓”的面积阈值。
     pub grab_area: f32,
-    /// “太近了、先后退”的面积阈值,须大于 grab_area。
+    /// “太近了、先后退”的面积阈值,须大于 grab_area;相等时每次抓取起手都会
+    /// 先退再复判(退到带内才盲转),实际抓取距离由复判而不是盲退时长决定。
     pub grab_area_max: f32,
     /// 抓取前盲转微调的次数(补偿爪子偏心)。
     pub grab_turn_count: i32,
@@ -134,8 +135,13 @@ pub struct GrabConfig {
     pub grab_turn_speed: i32,
     /// 抓取前盲转微调的转向:left 左转、right 右转,按爪子相对相机的偏心方向选。
     pub grab_turn_direction: GrabTurnDirection,
-    /// 连续满足“够近且居中”的确认帧数,防单帧误检。
-    pub grab_confirm_threshold: i32,
+    /// 面积比 EMA 系数(0~1):越小越平滑,单帧框抖动不直接碰阈值线。
+    pub area_filter_alpha: f32,
+    /// “够近”触发线的滞回带宽(占 grab_area 的比例):带内抖动不清驻留计时。
+    pub grab_hysteresis_frac: f32,
+    /// “够近且居中”须连续保持的驻留时长(毫秒)。用时间不用帧数,
+    /// 否则确认窗随帧率跑(旧 grab_confirm_threshold 帧数口径已废弃)。
+    pub grab_confirm_ms: u64,
     /// 丢失宽限帧数,超过才判定真丢并开始搜索。
     pub lost_grace_frames: i32,
     /// 太近时后退的时长。
@@ -162,7 +168,9 @@ impl Default for GrabConfig {
             grab_turn_count: GRAB_TURN_COUNT,
             grab_turn_speed: GRAB_TURN_SPEED,
             grab_turn_direction: GrabTurnDirection::default(),
-            grab_confirm_threshold: GRAB_CONFIRM_THRESHOLD,
+            area_filter_alpha: AREA_FILTER_ALPHA,
+            grab_hysteresis_frac: GRAB_HYSTERESIS_FRAC,
+            grab_confirm_ms: GRAB_CONFIRM_MS,
             lost_grace_frames: LOST_GRACE_FRAMES,
             grab_backoff_ms: GRAB_BACKOFF_MS,
             grab_turn_ms: GRAB_TURN_MS,
